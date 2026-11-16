@@ -66,14 +66,14 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     logging::start(cli.verbose);
     let result = match cli.command {
-        Command::Dump(args) => dump::run(&args),
-        Command::Stats(args) => stats::run(&args),
-        Command::Seq(args) => seq::run(&args),
+        Command::Dump(args) => dump::run(&args).map(|()| ExitCode::SUCCESS),
+        Command::Stats(args) => stats::run(&args).map(|()| ExitCode::SUCCESS),
+        Command::Seq(args) => seq::run(&args).map(|()| ExitCode::SUCCESS),
         #[cfg(feature = "sync")]
         Command::Sync(args) => sync::run(&args),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         // The reader of the output went away, as `head` does once it has its lines: nothing is left to do.
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         Err(e) => {

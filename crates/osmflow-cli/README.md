@@ -226,6 +226,7 @@ export DATABASE_URL=postgresql://postgres@localhost/osm OSMFLOW_SYNC_DIR=dc-file
 osmflow sync import dc.osm.pbf                  # the extract, its replication stream from its header
 osmflow sync update                             # every diff after it, up to the stream's latest
 osmflow sync update --until 4960 --max-diffs 1  # up to diff 4960, one diff per transaction
+osmflow sync update --follow --max-runtime 20m  # then wait for newer diffs, for at most 20 minutes
 osmflow sync status                             # where the database and its files are
 osmflow sync rebuild                            # the files again, from the database
 osmflow sync rebuild --pbf dc-new.osm.pbf       # the node file from a new download and the diffs after it
@@ -245,7 +246,12 @@ reverse index revision 13, up to date
   `--connections` sets how many database connections copy the rows at once: half the cores, up to 8, by default.
 - **`update`** checks that the stream is the database's, downloads the diffs into `--cache`, `<dir>/replication` by
   default, where a diff is never downloaded again, and applies up to `--max-diffs` of them (60 by default) per transaction. A stream given as a directory is read
-  where it is. If a crash left the files behind the database, it brings them up to it first.
+  where it is. If a crash left the files behind the database, it brings them up to it first. With `--follow` it then
+  waits (`--wait` seconds, 60 by default) for newer diffs and applies them, until stopped. `--max-runtime` (`90s`,
+  `20m`, `2h` or `1h30m`) and the first Ctrl+C or SIGTERM stop it before the next batch, after finishing the one in
+  progress; a second Ctrl+C stops it at once, and the next update repairs what it left half done. The exit code is
+  0 when the database is up to date at the end, 3 when `--max-runtime` stopped the update first, and 130 when a
+  signal did.
 - **`rebuild`** only reads the database. Without `--pbf`, the node locations come from the database's way geometries
   and tagged nodes, which have every node a way uses, but not an untagged node in no way (2 of District of
   Columbia's 1.96 million), which matters only if a later edit adds it to a way; with it, from the PBF file and the

@@ -1,14 +1,18 @@
 //! `osmflow sync`: OpenStreetMap data in PostgreSQL, imported from a PBF file and kept current from replication.
 
+use std::convert::Infallible;
 use std::fmt;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use osmflow::PbfReader;
 use osmflow::osc::Replication;
 use osmflow_sync::{
-    DbState, FileStamp, GeometryFormat, ImportOpts, Mirror, Rebuild, SyncError, UpdateOpts,
+    DbState, FileStamp, FollowEnd, FollowOpts, GeometryFormat, ImportOpts, Mirror, Rebuild, Signal,
+    Stop, StopReason, SyncError, UpdateOpts,
 };
 
 use crate::input::fetch;
@@ -80,14 +84,28 @@ enum Command {
     /// Applies the replication diffs after the database's sequence, up to the latest.
     ///
     /// Brings the node file and the reverse index up to the database first, if a crash left them behind.
+    ///
+    /// Stops before the next batch when `--max-runtime` has passed or on the first Ctrl+C or SIGTERM, finishing the
+    /// batch in progress; a second Ctrl+C stops at once, and the next update repairs what it left half done. The
+    /// exit code is 0 when the database is up to date at the end, 3 when `--max-runtime` stopped the update first,
+    /// and 130 when a signal did.
     Update {
         #[command(flatten)]
         place: Place,
         #[command(flatten)]
         diffs: Diffs,
         /// The last sequence to apply.
-        #[arg(long, value_name = "SEQ")]
+        #[arg(long, value_name = "SEQ", conflicts_with = "follow")]
         until: Option<u64>,
+        /// When up to date, wait for newer diffs and apply them, until stopped.
+        #[arg(long)]
+        follow: bool,
+        /// With --follow, how many seconds to wait for a newer diff when up to date.
+        #[arg(long, default_value_t = 60, value_name = "SECS", requires = "follow")]
+        wait: u64,
+        /// Stop before the next batch once this much time has passed: `90s`, `20m`, `2h` or a sum such as `1h30m`.
+        #[arg(long, value_parser = parse_duration, value_name = "TIME")]
+        max_runtime: Option<Duration>,
     },
     /// Makes the node file and the reverse index again, up to the database. The database is only read.
     ///
@@ -113,7 +131,7 @@ enum Command {
     },
 }
 
-pub fn run(args: &Args) -> Result<()> {
+pub fn run(args: &Args) -> Result<ExitCode> {
     match &args.command {
         Command::Import {
             place,
@@ -145,28 +163,19 @@ pub fn run(args: &Args) -> Result<()> {
             let s = mirror(place)
                 .import(pbf, stream.as_ref(), &opts)
                 .with_context(|| format!("importing {}", pbf.display()))?;
-            out(format_args!(
+            done(out(format_args!(
                 "imported {} nodes: {} tagged, {} ways, {} relations; {} reverse index pairs",
                 s.nodes, s.tagged_nodes, s.ways, s.relations, s.pairs
-            ))
+            )))
         }
         Command::Update {
             place,
             diffs,
             until,
-        } => {
-            let mirror = mirror(place);
-            let replication = replication(&mirror, place, diffs)?;
-            let opts = UpdateOpts {
-                max_diffs: diffs.max_diffs,
-                until: *until,
-            };
-            let s = mirror.update(&replication, &opts).context("updating")?;
-            out(format_args!(
-                "applied {} diffs in {} batches: {} rows, {} ways moved by their nodes; now at sequence {}",
-                s.diffs, s.batches, s.rows, s.moved_ways, s.sequence
-            ))
-        }
+            follow,
+            wait,
+            max_runtime,
+        } => update(place, diffs, *until, *follow, *wait, *max_runtime),
         Command::Rebuild {
             place,
             pbf,
@@ -188,10 +197,10 @@ pub fn run(args: &Args) -> Result<()> {
                 }
             }
             .context("rebuilding")?;
-            out(format_args!(
+            done(out(format_args!(
                 "rebuilt the node file from {} nodes and {} diffs, and the reverse index with {} pairs",
                 s.nodes, s.diffs, s.pairs
-            ))
+            )))
         }
         Command::Status { place } => {
             let s = mirror(place).status()?;
@@ -209,9 +218,147 @@ pub fn run(args: &Args) -> Result<()> {
             }
             writeln!(o, " of {}", url.as_deref().unwrap_or("no stream"))?;
             writeln!(o, "node file     {}", file(&s.nodes, &s.db))?;
-            Ok(writeln!(o, "reverse index {}", file(&s.index, &s.db))?)
+            writeln!(o, "reverse index {}", file(&s.index, &s.db))?;
+            Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Applies diffs, once up to the latest or with `follow` until stopped; the exit code says how it ended.
+fn update(
+    place: &Place,
+    diffs: &Diffs,
+    until: Option<u64>,
+    follow: bool,
+    wait: u64,
+    max_runtime: Option<Duration>,
+) -> Result<ExitCode> {
+    let mirror = mirror(place);
+    let replication = replication(&mirror, place, diffs)?;
+    let stop = stop(max_runtime)?;
+    let (s, stopped) = if follow {
+        let opts = FollowOpts {
+            max_diffs: diffs.max_diffs,
+            wait: Duration::from_secs(wait),
+            once: false,
+            stop,
+        };
+        let followed = mirror
+            .open()?
+            .follow(&replication, &opts, |_, _| Ok::<(), Infallible>(()))
+            .context("updating")?;
+        let stopped = match followed.end {
+            FollowEnd::UpToDate => None,
+            FollowEnd::Stopped(reason) => Some(reason),
+        };
+        (followed.stats, stopped)
+    } else {
+        let opts = UpdateOpts {
+            max_diffs: diffs.max_diffs,
+            until,
+            stop,
+        };
+        let s = mirror.update(&replication, &opts).context("updating")?;
+        let stopped = s.stopped;
+        (s, stopped)
+    };
+    out(format_args!(
+        "applied {} diffs in {} batches: {} rows, {} ways moved by their nodes; now at sequence {}",
+        s.diffs, s.batches, s.rows, s.moved_ways, s.sequence
+    ))?;
+    if let Some(reason) = stopped {
+        out(format_args!(
+            "stopped before the next batch: {}",
+            why(reason)
+        ))?;
+    }
+    Ok(exit_code(stopped))
+}
+
+/// Success, after a command that ran to its end.
+fn done(result: Result<()>) -> Result<ExitCode> {
+    result.map(|()| ExitCode::SUCCESS)
+}
+
+/// A stop that asks when `max_runtime` has passed and on the first Ctrl+C or SIGTERM, telling the user what each
+/// signal does.
+fn stop(max_runtime: Option<Duration>) -> Result<Stop> {
+    let stop = max_runtime.map_or_else(Stop::new, |runtime| Stop::new().with_max_runtime(runtime));
+    stop.on_signals(|signal| match signal {
+        Signal::First => say(
+            "Stopping after the batch in progress, so that the database and its files stay consistent. Press \
+             Ctrl+C again to stop right now: the batch in progress is then rolled back, and the next update \
+             repairs what it left half done.",
+        ),
+        Signal::Again => say(
+            "Stopping right now. The batch in progress was not committed; the next update does it again and \
+             repairs anything left half done.",
+        ),
+    })?;
+    Ok(stop)
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "the signal messages go to standard error"
+)]
+fn say(message: &str) {
+    eprintln!("{message}");
+}
+
+fn why(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Requested => "asked to stop",
+        StopReason::TimeLimit => "the time limit passed",
+    }
+}
+
+/// 0 when up to date, 3 when the time limit stopped the update, 130 when a signal did.
+fn exit_code(stopped: Option<StopReason>) -> ExitCode {
+    match stopped {
+        None => ExitCode::SUCCESS,
+        Some(StopReason::TimeLimit) => ExitCode::from(3),
+        Some(StopReason::Requested) => ExitCode::from(130),
+    }
+}
+
+/// A duration such as `90s`, `20m`, `2h` or `1h30m`: whole numbers with a unit, adding up to more than zero.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let mut total = 0_u64;
+    let mut digits = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        let unit = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            _ => {
+                return Err(format!(
+                    "`{text}` is not a time: use whole numbers with s, m or h, such as 90s or 1h30m"
+                ));
+            }
+        };
+        let n: u64 = digits
+            .parse()
+            .map_err(|_| format!("`{text}` is not a time: a unit needs a number before it"))?;
+        digits.clear();
+        total = n
+            .checked_mul(unit)
+            .and_then(|seconds| total.checked_add(seconds))
+            .ok_or_else(|| format!("`{text}` is too long"))?;
+    }
+    if !digits.is_empty() {
+        return Err(format!(
+            "`{text}` has a number with no unit: write 90s, 20m or 2h"
+        ));
+    }
+    if total == 0 {
+        return Err(format!("`{text}` is not a time above zero"));
+    }
+    Ok(Duration::from_secs(total))
 }
 
 fn out(line: fmt::Arguments<'_>) -> Result<()> {
@@ -281,10 +428,18 @@ mod tests {
         args: Args,
     }
 
+    /// `ExitCode` has no equality, but its debug form shows the code.
+    fn is_success(code: ExitCode) -> bool {
+        format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS)
+    }
+
     /// Runs `osmflow sync` with `args`.
     fn sync(args: &[&str]) {
         let cli = Sync::try_parse_from(["sync"].iter().chain(args)).unwrap();
-        run(&cli.args).unwrap();
+        assert!(
+            is_success(run(&cli.args).unwrap()),
+            "{args:?} did not succeed"
+        );
     }
 
     /// Every subcommand of `osmflow sync`, against the database `OSMFLOW_SYNC_TEST_DB` names (`just test-with-db`
@@ -363,5 +518,67 @@ mod tests {
                 assert_eq!(at(2), 1709, "{geometry} {from:?}");
             }
         }
+    }
+
+    #[test]
+    fn durations_have_units() {
+        assert_eq!(parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("20m"), Ok(Duration::from_mins(20)));
+        assert_eq!(parse_duration("2h"), Ok(Duration::from_hours(2)));
+        assert_eq!(parse_duration("1h30m"), Ok(Duration::from_mins(90)));
+        assert_eq!(parse_duration("1h30m15s"), Ok(Duration::from_secs(5415)));
+    }
+
+    #[test]
+    fn durations_that_are_not_times_are_rejected() {
+        for bad in [
+            "",
+            "20",
+            "m",
+            "0s",
+            "0m0s",
+            "5x",
+            "-1m",
+            "1.5h",
+            "1 m",
+            "99999999999999999999h",
+        ] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn exit_codes_say_why_the_update_stopped() {
+        // `ExitCode` has no equality, but its debug form shows the code
+        let code = |stopped| format!("{:?}", exit_code(stopped));
+        assert_eq!(code(None), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(
+            code(Some(StopReason::TimeLimit)),
+            format!("{:?}", ExitCode::from(3))
+        );
+        assert_eq!(
+            code(Some(StopReason::Requested)),
+            format!("{:?}", ExitCode::from(130))
+        );
+    }
+
+    #[test]
+    fn follow_and_wait_and_until_fit_together_as_documented() {
+        let parse = |args: &[&str]| {
+            Sync::try_parse_from(
+                ["sync", "update", "--db", "x", "--dir", "y"]
+                    .iter()
+                    .chain(args),
+            )
+            .is_ok()
+        };
+        assert!(parse(&["--follow", "--wait", "5", "--max-runtime", "20m"]));
+        assert!(parse(&["--until", "4960"]));
+        assert!(!parse(&["--wait", "5"]), "--wait needs --follow");
+        assert!(
+            !parse(&["--follow", "--until", "4960"]),
+            "--until and --follow exclude each other"
+        );
+        assert!(!parse(&["--max-runtime", "20"]), "a time needs a unit");
     }
 }

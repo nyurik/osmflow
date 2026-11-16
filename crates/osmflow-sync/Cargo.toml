@@ -12,8 +12,13 @@ categories = ["science::geo", "database"]
 readme = "README.md"
 rust-version.workspace = true
 
+[features]
+# `Stop::on_signals`: Ctrl+C and SIGTERM asking an update to stop
+signals = ["dep:ctrlc"]
+
 [dependencies]
 crossbeam-channel.workspace = true
+ctrlc = { workspace = true, optional = true }
 geo-traits.workspace = true
 osmflow = { workspace = true, features = ["nodes", "osc", "pbf"] }
 postgres.workspace = true

@@ -26,7 +26,7 @@ default = ["http", "sync"]
 # Reading replication streams from servers; without it, an http:// or https:// input is an error
 http = ["osmflow/http"]
 # `osmflow sync`: OpenStreetMap data in PostgreSQL
-sync = ["dep:osmflow-sync"]
+sync = ["dep:osmflow-sync", "osmflow-sync/signals"]
 
 [dependencies]
 anyhow.workspace = true
