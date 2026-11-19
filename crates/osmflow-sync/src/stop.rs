@@ -1,4 +1,4 @@
-//! Asking a long update to stop: by a time limit, by code, or by Ctrl+C and SIGTERM.
+//! Asking a long update to stop: by a time limit, by code, or by Ctrl+C, SIGTERM and SIGHUP.
 
 #[cfg(feature = "signals")]
 use std::process;
@@ -15,7 +15,7 @@ const WAIT_STEP: Duration = Duration::from_millis(250);
 /// Why work was asked to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// [`Stop::request`] was called: by code, or by the first Ctrl+C or SIGTERM after `Stop::on_signals`.
+    /// [`Stop::request`] was called: by code, or by the first signal after `Stop::on_signals`.
     Requested,
     /// The time set with [`Stop::with_max_runtime`] has passed.
     TimeLimit,
@@ -25,7 +25,7 @@ pub enum StopReason {
 /// finishes the batch it has begun, so the database and its files stay consistent.
 ///
 /// It stops on a time limit, on [`request`](Self::request) from any thread, and, with the `signals` feature, on
-/// Ctrl+C and SIGTERM. A default `Stop` never asks.
+/// Ctrl+C, SIGTERM and SIGHUP. A default `Stop` never asks.
 #[derive(Debug, Clone, Default)]
 pub struct Stop {
     requested: Arc<AtomicBool>,
@@ -90,19 +90,19 @@ impl Stop {
 #[cfg(feature = "signals")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
-    /// The first Ctrl+C or SIGTERM: a stop was requested, and the work in progress finishes first.
+    /// The first Ctrl+C, SIGTERM or SIGHUP: a stop was requested, and the work in progress finishes first.
     First,
     /// Any later one: the process exits at once, as soon as the notification returns.
     Again,
 }
 
-/// Ctrl+C and SIGTERM could not be handled, because another handler was already installed or the system refused.
+/// The signals could not be handled, because another handler was already installed or the system refused.
 #[cfg(feature = "signals")]
 #[derive(Debug, thiserror::Error)]
-#[error("cannot handle Ctrl+C and SIGTERM: {0}")]
+#[error("cannot handle Ctrl+C, SIGTERM and SIGHUP: {0}")]
 pub struct SignalError(String);
 
-/// The exit status when a second signal ends the process: 128 plus SIGINT, as shells report Ctrl+C.
+/// The exit status when a signal ends the process at once: 128 plus SIGINT, as shells report Ctrl+C.
 #[cfg(feature = "signals")]
 const AGAIN_EXIT_STATUS: i32 = 130;
 
@@ -120,12 +120,13 @@ static LISTENER: Mutex<Option<Listener>> = Mutex::new(None);
 #[cfg(feature = "signals")]
 static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
 
-/// The signal handler: records the signal on the listener's stop, tells it, and ends the process on a second one.
+/// The signal handler: records the signal on the listener's stop, tells it, and ends the process on a second one,
+/// or at once when no [`SignalGuard`] is alive, as it would end without a handler.
 #[cfg(feature = "signals")]
 fn dispatch() {
     let listener = LISTENER.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(listener) = listener.as_ref() else {
-        return;
+        exit_now();
     };
     let signal = listener.stop.advance();
     (listener.notify)(signal);
@@ -136,7 +137,7 @@ fn dispatch() {
 
 #[cfg(feature = "signals")]
 impl Stop {
-    /// Makes Ctrl+C and SIGTERM ask this stop to stop, in two steps.
+    /// Makes Ctrl+C, SIGTERM and SIGHUP ask this stop to stop, in two steps, while the returned guard is alive.
     ///
     /// The first signal calls [`request`](Self::request) and then `notify(Signal::First)`: the update finishes the
     /// batch it has begun and returns. A second signal, or one that arrives after a request made in any other way,
@@ -145,9 +146,13 @@ impl Stop {
     ///
     /// `notify` runs on the signal-handling thread, and is the place to tell the user, as osmflow itself prints
     /// nothing. A process has one signal handler, which tells the stop of the latest call: calling this again, for
-    /// the next run, replaces the earlier stop and `notify`. It fails if other code already installed a handler for
-    /// these signals.
-    pub fn on_signals(&self, notify: impl Fn(Signal) + Send + 'static) -> Result<(), SignalError> {
+    /// the next run, replaces the earlier stop and `notify`. Once the latest call's guard is dropped, a signal ends
+    /// the process at once with status 130, as without a handler. It fails if other code already installed a
+    /// handler for these signals.
+    pub fn on_signals(
+        &self,
+        notify: impl Fn(Signal) + Send + 'static,
+    ) -> Result<SignalGuard, SignalError> {
         INSTALLED
             .get_or_init(|| ctrlc::set_handler(dispatch).map_err(|e| e.to_string()))
             .clone()
@@ -156,7 +161,9 @@ impl Stop {
             stop: self.clone(),
             notify: Box::new(notify),
         });
-        Ok(())
+        Ok(SignalGuard {
+            requested: Arc::clone(&self.requested),
+        })
     }
 
     /// Records a signal: the first asks to stop, and any later one, or one after a request, asks to stop at once.
@@ -165,6 +172,28 @@ impl Stop {
             Signal::Again
         } else {
             Signal::First
+        }
+    }
+}
+
+/// Keeps the signals asking a stop to stop, from [`Stop::on_signals`]: once dropped, a signal ends the process at
+/// once, unless a later call gave them to another stop.
+#[cfg(feature = "signals")]
+#[must_use = "dropping the guard makes the next signal end the process at once"]
+#[derive(Debug)]
+pub struct SignalGuard {
+    requested: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "signals")]
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        let mut listener = LISTENER.lock().unwrap_or_else(PoisonError::into_inner);
+        if listener
+            .as_ref()
+            .is_some_and(|l| Arc::ptr_eq(&l.stop.requested, &self.requested))
+        {
+            *listener = None;
         }
     }
 }
@@ -256,11 +285,27 @@ mod tests {
         assert_eq!(stop.advance(), Signal::Again);
     }
 
+    /// The one test of the process's handler, which tests running at the same time would share.
     #[cfg(feature = "signals")]
     #[test]
-    fn the_handler_can_be_given_to_another_stop_for_the_next_run() {
-        Stop::new().on_signals(|_| {}).unwrap();
-        Stop::new().on_signals(|_| {}).unwrap();
+    fn the_handler_tells_the_latest_stop_while_its_guard_lives() {
+        let listens = |stop: &Stop| {
+            LISTENER
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|l| Arc::ptr_eq(&l.stop.requested, &stop.requested))
+        };
+        let (first, second) = (Stop::new(), Stop::new());
+        let first_guard = first.on_signals(|_| {}).unwrap();
+        assert!(listens(&first));
+        let second_guard = second.on_signals(|_| {}).unwrap();
+        assert!(listens(&second));
+        // The earlier guard no longer owns the handler, so dropping it changes nothing
+        drop(first_guard);
+        assert!(listens(&second));
+        drop(second_guard);
+        assert!(LISTENER.lock().unwrap().is_none());
     }
 
     #[cfg(feature = "signals")]

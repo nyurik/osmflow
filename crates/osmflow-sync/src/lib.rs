@@ -22,11 +22,11 @@ use postgres::Client;
 
 pub use crate::db::{DbState, GeometryFormat};
 pub use crate::error::SyncError;
-pub use crate::follow::{FollowEnd, FollowError, FollowOpts, Followed};
+pub use crate::follow::{FollowError, FollowOpts};
 pub use crate::import::{ImportOpts, ImportStats};
 pub use crate::rebuild::{Rebuild, RebuildStats};
 #[cfg(feature = "signals")]
-pub use crate::stop::{Signal, SignalError};
+pub use crate::stop::{Signal, SignalError, SignalGuard};
 pub use crate::stop::{Stop, StopReason};
 pub use crate::update::{UpdateOpts, UpdateStats};
 

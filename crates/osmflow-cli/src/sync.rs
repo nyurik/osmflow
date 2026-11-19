@@ -11,8 +11,8 @@ use anyhow::{Context as _, Result};
 use osmflow::PbfReader;
 use osmflow::osc::Replication;
 use osmflow_sync::{
-    DbState, FileStamp, FollowEnd, FollowOpts, GeometryFormat, ImportOpts, Mirror, Rebuild, Signal,
-    Stop, StopReason, SyncError, UpdateOpts,
+    DbState, FileStamp, FollowOpts, GeometryFormat, ImportOpts, Mirror, Rebuild, Signal, Stop,
+    StopReason, SyncError, UpdateOpts,
 };
 
 use crate::input::fetch;
@@ -85,8 +85,8 @@ enum Command {
     ///
     /// Brings the node file and the reverse index up to the database first, if a crash left them behind.
     ///
-    /// Stops before the next batch when `--max-runtime` has passed or on the first Ctrl+C or SIGTERM, finishing the
-    /// batch in progress; a second Ctrl+C stops at once, and the next update repairs what it left half done. The
+    /// Stops before the next batch when `--max-runtime` has passed or on the first Ctrl+C, SIGTERM or SIGHUP,
+    /// finishing the batch in progress; a second Ctrl+C stops at once, and the next update repairs what it left half done. The
     /// exit code is 0 when the database is up to date at the end, 3 when `--max-runtime` stopped the update first,
     /// and 130 when a signal did.
     Update {
@@ -100,9 +100,9 @@ enum Command {
         /// When up to date, wait for newer diffs and apply them, until stopped.
         #[arg(long)]
         follow: bool,
-        /// With --follow, how many seconds to wait for a newer diff when up to date.
-        #[arg(long, default_value_t = 60, value_name = "SECS", requires = "follow")]
-        wait: u64,
+        /// With --follow, how long to wait for a newer diff when up to date: `30s`, `5m`, as --max-runtime.
+        #[arg(long, default_value = "60s", value_parser = parse_duration, value_name = "TIME", requires = "follow")]
+        wait: Duration,
         /// Stop before the next batch once this much time has passed: `90s`, `20m`, `2h` or a sum such as `1h30m`.
         #[arg(long, value_parser = parse_duration, value_name = "TIME")]
         max_runtime: Option<Duration>,
@@ -163,10 +163,11 @@ pub fn run(args: &Args) -> Result<ExitCode> {
             let s = mirror(place)
                 .import(pbf, stream.as_ref(), &opts)
                 .with_context(|| format!("importing {}", pbf.display()))?;
-            done(out(format_args!(
+            out(format_args!(
                 "imported {} nodes: {} tagged, {} ways, {} relations; {} reverse index pairs",
                 s.nodes, s.tagged_nodes, s.ways, s.relations, s.pairs
-            )))
+            ))
+            .map(|()| ExitCode::SUCCESS)
         }
         Command::Update {
             place,
@@ -197,10 +198,11 @@ pub fn run(args: &Args) -> Result<ExitCode> {
                 }
             }
             .context("rebuilding")?;
-            done(out(format_args!(
+            out(format_args!(
                 "rebuilt the node file from {} nodes and {} diffs, and the reverse index with {} pairs",
                 s.nodes, s.diffs, s.pairs
-            )))
+            ))
+            .map(|()| ExitCode::SUCCESS)
         }
         Command::Status { place } => {
             let s = mirror(place).status()?;
@@ -230,61 +232,45 @@ fn update(
     diffs: &Diffs,
     until: Option<u64>,
     follow: bool,
-    wait: u64,
+    wait: Duration,
     max_runtime: Option<Duration>,
 ) -> Result<ExitCode> {
     let mirror = mirror(place);
     let replication = replication(&mirror, place, diffs)?;
-    let stop = stop(max_runtime)?;
-    let (s, stopped) = if follow {
+    let stop = max_runtime.map_or_else(Stop::new, |runtime| Stop::new().with_max_runtime(runtime));
+    let _signals = stop.on_signals(tell)?;
+    let s = if follow {
         let opts = FollowOpts {
             max_diffs: diffs.max_diffs,
-            wait: Duration::from_secs(wait),
+            wait,
             once: false,
             stop,
         };
-        let followed = mirror
+        mirror
             .open()?
             .follow(&replication, &opts, |_, _| Ok::<(), Infallible>(()))
-            .context("updating")?;
-        let stopped = match followed.end {
-            FollowEnd::UpToDate => None,
-            FollowEnd::Stopped(reason) => Some(reason),
-        };
-        (followed.stats, stopped)
     } else {
         let opts = UpdateOpts {
             max_diffs: diffs.max_diffs,
             until,
             stop,
         };
-        let s = mirror.update(&replication, &opts).context("updating")?;
-        let stopped = s.stopped;
-        (s, stopped)
-    };
+        mirror.update(&replication, &opts).map_err(Into::into)
+    }
+    .context("updating")?;
     out(format_args!(
         "applied {} diffs in {} batches: {} rows, {} ways moved by their nodes; now at sequence {}",
         s.diffs, s.batches, s.rows, s.moved_ways, s.sequence
     ))?;
-    if let Some(reason) = stopped {
-        out(format_args!(
-            "stopped before the next batch: {}",
-            why(reason)
-        ))?;
+    if let Some(reason) = s.stopped {
+        out(format_args!("stopped: {}", why(reason)))?;
     }
-    Ok(exit_code(stopped))
+    Ok(exit_code(s.stopped))
 }
 
-/// Success, after a command that ran to its end.
-fn done(result: Result<()>) -> Result<ExitCode> {
-    result.map(|()| ExitCode::SUCCESS)
-}
-
-/// A stop that asks when `max_runtime` has passed and on the first Ctrl+C or SIGTERM, telling the user what each
-/// signal does.
-fn stop(max_runtime: Option<Duration>) -> Result<Stop> {
-    let stop = max_runtime.map_or_else(Stop::new, |runtime| Stop::new().with_max_runtime(runtime));
-    stop.on_signals(|signal| match signal {
+/// Tells the user what a Ctrl+C, SIGTERM or SIGHUP does.
+fn tell(signal: Signal) {
+    match signal {
         Signal::First => say(
             "Stopping after the batch in progress, so that the database and its files stay consistent. Press \
              Ctrl+C again to stop right now: the batch in progress is then rolled back, and the next update \
@@ -294,8 +280,7 @@ fn stop(max_runtime: Option<Duration>) -> Result<Stop> {
             "Stopping right now. The batch in progress was not committed; the next update does it again and \
              repairs anything left half done.",
         ),
-    })?;
-    Ok(stop)
+    }
 }
 
 #[expect(
@@ -429,15 +414,15 @@ mod tests {
     }
 
     /// `ExitCode` has no equality, but its debug form shows the code.
-    fn is_success(code: ExitCode) -> bool {
-        format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS)
+    fn code(code: ExitCode) -> String {
+        format!("{code:?}")
     }
 
     /// Runs `osmflow sync` with `args`.
     fn sync(args: &[&str]) {
         let cli = Sync::try_parse_from(["sync"].iter().chain(args)).unwrap();
         assert!(
-            is_success(run(&cli.args).unwrap()),
+            code(run(&cli.args).unwrap()) == code(ExitCode::SUCCESS),
             "{args:?} did not succeed"
         );
     }
@@ -549,16 +534,14 @@ mod tests {
 
     #[test]
     fn exit_codes_say_why_the_update_stopped() {
-        // `ExitCode` has no equality, but its debug form shows the code
-        let code = |stopped| format!("{:?}", exit_code(stopped));
-        assert_eq!(code(None), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(code(exit_code(None)), code(ExitCode::SUCCESS));
         assert_eq!(
-            code(Some(StopReason::TimeLimit)),
-            format!("{:?}", ExitCode::from(3))
+            code(exit_code(Some(StopReason::TimeLimit))),
+            code(ExitCode::from(3))
         );
         assert_eq!(
-            code(Some(StopReason::Requested)),
-            format!("{:?}", ExitCode::from(130))
+            code(exit_code(Some(StopReason::Requested))),
+            code(ExitCode::from(130))
         );
     }
 
@@ -572,9 +555,10 @@ mod tests {
             )
             .is_ok()
         };
-        assert!(parse(&["--follow", "--wait", "5", "--max-runtime", "20m"]));
+        assert!(parse(&["--follow", "--wait", "5s", "--max-runtime", "20m"]));
         assert!(parse(&["--until", "4960"]));
-        assert!(!parse(&["--wait", "5"]), "--wait needs --follow");
+        assert!(!parse(&["--wait", "5s"]), "--wait needs --follow");
+        assert!(!parse(&["--follow", "--wait", "5"]), "a wait needs a unit");
         assert!(
             !parse(&["--follow", "--until", "4960"]),
             "--until and --follow exclude each other"

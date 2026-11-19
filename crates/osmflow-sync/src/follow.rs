@@ -6,6 +6,7 @@ use std::time::Duration;
 use osmflow::osc::Replication;
 
 use crate::db::DbState;
+use crate::update::batch_end;
 use crate::{OpenMirror, Stop, StopReason, SyncError, UpdateOpts, UpdateStats};
 
 /// How [`OpenMirror::follow`] keeps up with the replication stream.
@@ -32,25 +33,6 @@ impl Default for FollowOpts {
     }
 }
 
-/// Why [`OpenMirror::follow`] returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FollowEnd {
-    /// The database had every diff the stream had: with `once` when it first did, otherwise when the time limit
-    /// passed while waiting for a newer one.
-    UpToDate,
-    /// A stop was asked for before the next batch, which may leave the database behind the stream.
-    Stopped(StopReason),
-}
-
-/// What [`OpenMirror::follow`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Followed {
-    /// Why it returned.
-    pub end: FollowEnd,
-    /// The batches it applied, added up: `sequence` is the database's last one, and `stopped` is not set.
-    pub stats: UpdateStats,
-}
-
 /// An error of [`OpenMirror::follow`]: the update's, or the one the caller's function returned.
 #[derive(Debug, thiserror::Error)]
 pub enum FollowError<E: Error + 'static> {
@@ -71,65 +53,50 @@ impl OpenMirror {
     /// each batch and while waiting, so the function always runs for a batch before the loop returns. An error from
     /// it ends the loop with [`FollowError::Batch`].
     ///
-    /// A stop asked for while waiting for a newer diff, with the database up to date, ends in
-    /// [`FollowEnd::UpToDate`] when it is the time limit, and in [`FollowEnd::Stopped`] when it was requested.
+    /// The statistics returned add up the batches. [`UpdateStats::stopped`] says why a stop ended the loop, except
+    /// for the time limit passing while the database is up to date, waiting for a newer diff: that is how a follow
+    /// with a time limit ends when all went well, as `once` does.
     pub fn follow<E: Error + 'static>(
         &mut self,
         replication: &Replication,
         opts: &FollowOpts,
         mut after_batch: impl FnMut(&Self, &UpdateStats) -> Result<(), E>,
-    ) -> Result<Followed, FollowError<E>> {
+    ) -> Result<UpdateStats, FollowError<E>> {
         let mut total = UpdateStats {
             sequence: DbState::read(&mut self.client)?.sequence,
             ..UpdateStats::default()
         };
-        let one_batch = UpdateOpts {
-            max_diffs: opts.max_diffs,
-            until: None,
-            stop: opts.stop.clone(),
-        };
         loop {
-            if let Some(reason) = opts.stop.reason() {
-                return Ok(Followed::new(FollowEnd::Stopped(reason), total));
-            }
-            let next = DbState::read(&mut self.client)?.sequence.cast_unsigned() + 1;
+            // Up to date is looked at before the stop, so a time limit that passes during the last batch ends the
+            // loop as up to date, as it does while waiting
+            let next = total.sequence.cast_unsigned() + 1;
             let latest = replication.state().map_err(SyncError::from)?.sequence;
             if latest < next {
                 if opts.once {
-                    return Ok(Followed::new(FollowEnd::UpToDate, total));
+                    return Ok(total);
                 }
                 match opts.stop.wait(opts.wait) {
                     None => continue,
-                    Some(StopReason::TimeLimit) => {
-                        return Ok(Followed::new(FollowEnd::UpToDate, total));
-                    }
+                    Some(StopReason::TimeLimit) => return Ok(total),
                     Some(StopReason::Requested) => {
-                        return Ok(Followed::new(
-                            FollowEnd::Stopped(StopReason::Requested),
-                            total,
-                        ));
+                        total.stopped = Some(StopReason::Requested);
+                        return Ok(total);
                     }
                 }
             }
-            let until = latest.min(next + opts.max_diffs.max(1) - 1);
             let batch = self.update(
                 replication,
                 &UpdateOpts {
-                    until: Some(until),
-                    ..one_batch.clone()
+                    max_diffs: opts.max_diffs,
+                    until: Some(batch_end(next, latest, opts.max_diffs)),
+                    stop: opts.stop.clone(),
                 },
             )?;
-            if let Some(reason) = batch.stopped {
-                return Ok(Followed::new(FollowEnd::Stopped(reason), total));
-            }
             total.add(&batch);
+            if batch.stopped.is_some() {
+                return Ok(total);
+            }
             after_batch(self, &batch).map_err(FollowError::Batch)?;
         }
-    }
-}
-
-impl Followed {
-    fn new(end: FollowEnd, stats: UpdateStats) -> Self {
-        Self { end, stats }
     }
 }

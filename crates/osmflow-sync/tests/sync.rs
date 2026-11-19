@@ -6,15 +6,15 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
-use std::{env, fs, io};
+use std::{env, fs, io, thread};
 
 use osmflow::Location;
 use osmflow::nodes::PagedStore;
 use osmflow::nodes::prelude::*;
 use osmflow::osc::Replication;
 use osmflow_sync::{
-    FileStamp, FollowEnd, FollowError, FollowOpts, GeometryFormat, ImportOpts, Mirror, NodeWay,
-    Rebuild, Stop, StopReason, UpdateOpts,
+    FileStamp, FollowError, FollowOpts, GeometryFormat, ImportOpts, Mirror, NodeWay, Rebuild, Stop,
+    StopReason, UpdateOpts,
 };
 use postgres::{Client, NoTls};
 
@@ -188,8 +188,6 @@ const DIFF_REPEATED: &str = r#"<create>
   </way>
 </create>"#;
 
-/// The node file rebuilt from the database has the locations the update gave the nodes of a way with a repeated
-/// point, in either format.
 /// A database imported from the fixture file at sequence 1708, and a stream with the four diffs after it.
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -237,28 +235,23 @@ fn follow_applies_the_stream_in_batches_and_stops_when_up_to_date() {
         ..FollowOpts::default()
     };
     let mut seen = Vec::new();
-    let followed = open
+    let stats = open
         .follow(&f.replication, &opts, |_, batch| {
             seen.push((batch.diffs, batch.sequence));
             Ok::<_, io::Error>(())
         })
         .unwrap();
-    assert_eq!(followed.end, FollowEnd::UpToDate);
     assert_eq!(seen, [(2, 1710), (2, 1712)]);
     assert_eq!(
-        (
-            followed.stats.batches,
-            followed.stats.diffs,
-            followed.stats.sequence
-        ),
-        (2, 4, 1712)
+        (stats.batches, stats.diffs, stats.sequence, stats.stopped),
+        (2, 4, 1712, None)
     );
     assert_eq!(sequence(&f.mirror), 1712);
     // Nothing is left, so another pass applies nothing
     let again = open
         .follow(&f.replication, &opts, |_, _| Ok::<_, io::Error>(()))
         .unwrap();
-    assert_eq!((again.end, again.stats.batches), (FollowEnd::UpToDate, 0));
+    assert_eq!((again.batches, again.stopped), (0, None));
 }
 
 #[test]
@@ -274,7 +267,7 @@ fn follow_finishes_the_batch_and_then_stops_when_requested() {
         stop: stop.clone(),
         ..FollowOpts::default()
     };
-    let followed = f
+    let stats = f
         .mirror
         .open()
         .unwrap()
@@ -283,8 +276,10 @@ fn follow_finishes_the_batch_and_then_stops_when_requested() {
             Ok::<_, io::Error>(())
         })
         .unwrap();
-    assert_eq!(followed.end, FollowEnd::Stopped(StopReason::Requested));
-    assert_eq!((followed.stats.batches, followed.stats.sequence), (1, 1709));
+    assert_eq!(
+        (stats.batches, stats.sequence, stats.stopped),
+        (1, 1709, Some(StopReason::Requested))
+    );
     assert_eq!(sequence(&f.mirror), 1709);
 }
 
@@ -296,19 +291,20 @@ fn a_time_limit_that_has_passed_applies_nothing() {
     let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
     let f = fixture(&url);
     let stop = Stop::new().with_max_runtime(Duration::ZERO);
-
     let opts = FollowOpts {
         stop: stop.clone(),
         ..FollowOpts::default()
     };
-    let followed = f
+    let stats = f
         .mirror
         .open()
         .unwrap()
         .follow(&f.replication, &opts, |_, _| Ok::<_, io::Error>(()))
         .unwrap();
-    assert_eq!(followed.end, FollowEnd::Stopped(StopReason::TimeLimit));
-    assert_eq!((followed.stats.batches, followed.stats.sequence), (0, 1708));
+    assert_eq!(
+        (stats.batches, stats.sequence, stats.stopped),
+        (0, 1708, Some(StopReason::TimeLimit))
+    );
 
     // An update stops the same way, and says why it did not reach the sequence it was asked for
     let update = UpdateOpts {
@@ -344,20 +340,49 @@ fn follow_waits_for_newer_diffs_until_the_time_limit() {
     };
     let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
     let f = fixture(&url);
+    let mut open = f.mirror.open().unwrap();
+    // Long enough for the one batch to start before it, even on a slow machine
     let opts = FollowOpts {
         wait: Duration::from_millis(20),
-        stop: Stop::new().with_max_runtime(Duration::from_millis(400)),
+        stop: Stop::new().with_max_runtime(Duration::from_secs(1)),
         ..FollowOpts::default()
     };
-    let followed = f
-        .mirror
-        .open()
-        .unwrap()
+    let stats = open
         .follow(&f.replication, &opts, |_, _| Ok::<_, io::Error>(()))
         .unwrap();
     // It applied all four diffs, then waited and ended at the limit, up to date
-    assert_eq!(followed.end, FollowEnd::UpToDate);
-    assert_eq!((followed.stats.diffs, followed.stats.sequence), (4, 1712));
+    assert_eq!(
+        (stats.diffs, stats.sequence, stats.stopped),
+        (4, 1712, None)
+    );
+}
+
+#[test]
+fn a_time_limit_that_passes_during_the_last_batch_ends_the_follow_up_to_date() {
+    let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
+        return;
+    };
+    let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
+    let f = fixture(&url);
+    let mut open = f.mirror.open().unwrap();
+    let stop = Stop::new().with_max_runtime(Duration::from_secs(1));
+    let opts = FollowOpts {
+        stop: stop.clone(),
+        ..FollowOpts::default()
+    };
+    let stats = open
+        .follow(&f.replication, &opts, |_, _| {
+            // The batch has every diff, and the limit passes before the loop looks again
+            while stop.reason().is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    assert_eq!(
+        (stats.batches, stats.sequence, stats.stopped),
+        (1, 1712, None)
+    );
 }
 
 #[test]
@@ -384,6 +409,8 @@ fn an_error_after_a_batch_ends_the_follow_with_the_batch_committed() {
     assert_eq!(sequence(&f.mirror), 1709);
 }
 
+/// The node file rebuilt from the database has the locations the update gave the nodes of a way with a repeated
+/// point, in either format.
 #[test]
 fn rebuild_keeps_repeated_points() {
     let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {

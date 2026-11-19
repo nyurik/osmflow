@@ -13,7 +13,7 @@ readme = "README.md"
 rust-version.workspace = true
 
 [features]
-# `Stop::on_signals`: Ctrl+C and SIGTERM asking an update to stop
+# `Stop::on_signals`: Ctrl+C, SIGTERM and SIGHUP asking an update to stop
 signals = ["dep:ctrlc"]
 
 [dependencies]
