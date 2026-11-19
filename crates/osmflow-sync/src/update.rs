@@ -14,7 +14,7 @@ use crate::copy::Rows;
 use crate::db::{self, DbState, Table};
 use crate::files::{read_diffs, set_locations, way_pairs};
 use crate::index::{Pair, ReverseIndex};
-use crate::{GeometryFormat, OpenMirror, SyncError};
+use crate::{GeometryFormat, OpenMirror, Stop, StopReason, SyncError};
 
 /// How to update.
 #[derive(Debug, Clone)]
@@ -24,6 +24,9 @@ pub struct UpdateOpts {
     pub max_diffs: u64,
     /// The last sequence to apply, instead of the stream's latest.
     pub until: Option<u64>,
+    /// Asks to stop: checked before each batch, so the batch in progress is finished and the update returns with
+    /// [`UpdateStats::stopped`] set. Never asks by default.
+    pub stop: Stop,
 }
 
 impl Default for UpdateOpts {
@@ -31,6 +34,7 @@ impl Default for UpdateOpts {
         Self {
             max_diffs: 60,
             until: None,
+            stop: Stop::default(),
         }
     }
 }
@@ -48,6 +52,21 @@ pub struct UpdateStats {
     pub moved_ways: u64,
     /// The sequence the database is now at.
     pub sequence: i64,
+    /// Why the update ended before the last sequence it was to apply, if a stop was asked for; none if it got there.
+    /// [`OpenMirror::follow`] sets it the same way, except when the time limit passes with the database up to date.
+    pub stopped: Option<StopReason>,
+}
+
+impl UpdateStats {
+    /// Adds the batches of `later`, an update that followed this one, and takes its sequence and stop.
+    pub(crate) fn add(&mut self, later: &Self) {
+        self.batches += later.batches;
+        self.diffs += later.diffs;
+        self.rows += later.rows;
+        self.moved_ways += later.moved_ways;
+        self.sequence = later.sequence;
+        self.stopped = later.stopped;
+    }
 }
 
 /// The changes of one or more diffs: of each object, its last version, or that it was deleted.
@@ -87,9 +106,9 @@ impl Changes {
 
 impl OpenMirror {
     /// Applies the diffs of `replication` after the database's sequence, up to the stream's latest or
-    /// [`UpdateOpts::until`]. The files are checked against the database first, and brought up to it if a crash or an
-    /// earlier error left them behind; a file of another database or ahead of it is an error, as on
-    /// [`Mirror::open`](crate::Mirror::open).
+    /// [`UpdateOpts::until`], or until [`UpdateOpts::stop`] asks to stop, between batches. The files are checked
+    /// against the database first, and brought up to it if a crash or an earlier error left them behind; a file of
+    /// another database or ahead of it is an error, as on [`Mirror::open`](crate::Mirror::open).
     pub fn update(
         &mut self,
         replication: &Replication,
@@ -137,8 +156,12 @@ fn apply_diffs(
     };
     let mut next = state.sequence.cast_unsigned() + 1;
     while next <= latest {
+        if let Some(reason) = opts.stop.reason() {
+            total.stopped = Some(reason);
+            break;
+        }
         let t = Instant::now();
-        let last = latest.min(next + opts.max_diffs.max(1) - 1);
+        let last = batch_end(next, latest, opts.max_diffs);
         let (changes, last_state) = read_diffs(replication, next..=last)?;
         let read = t.elapsed();
         let batch = Batch {
@@ -168,6 +191,11 @@ fn apply_diffs(
         next = last + 1;
     }
     Ok(total)
+}
+
+/// The last sequence of the batch that starts at `next`: at most `max_diffs` of them, one at least, up to `latest`.
+pub(crate) fn batch_end(next: u64, latest: u64, max_diffs: u64) -> u64 {
+    latest.min(next + max_diffs.max(1) - 1)
 }
 
 /// Checks that `replication` is the database's stream: its diff at the database's sequence has the database's time.

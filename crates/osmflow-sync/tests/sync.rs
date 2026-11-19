@@ -5,13 +5,17 @@
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
-use std::{env, fs};
+use std::time::Duration;
+use std::{env, fs, io, thread};
 
 use osmflow::Location;
 use osmflow::nodes::PagedStore;
 use osmflow::nodes::prelude::*;
 use osmflow::osc::Replication;
-use osmflow_sync::{FileStamp, GeometryFormat, ImportOpts, Mirror, NodeWay, Rebuild, UpdateOpts};
+use osmflow_sync::{
+    FileStamp, FollowError, FollowOpts, GeometryFormat, ImportOpts, Mirror, NodeWay, Rebuild, Stop,
+    StopReason, UpdateOpts,
+};
 use postgres::{Client, NoTls};
 
 const PBF: &str = concat!(
@@ -183,6 +187,227 @@ const DIFF_REPEATED: &str = r#"<create>
     <tag k="highway" v="path"/>
   </way>
 </create>"#;
+
+/// A database imported from the fixture file at sequence 1708, and a stream with the four diffs after it.
+struct Fixture {
+    _dir: tempfile::TempDir,
+    mirror: Mirror,
+    replication: Replication,
+}
+
+fn fixture(url: &str) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let diffs = dir.path().join("diffs");
+    write_state(&diffs, 708, STATE);
+    let mirror = Mirror::new(url, dir.path().join("files"));
+    import(&mirror, GeometryFormat::Twkb);
+    let mut db = Client::connect(url, NoTls).unwrap();
+    write_diffs(&diffs, &mut db);
+    // The stream's latest state, which follow reads to know what is new: diff 1712's
+    fs::write(
+        diffs.join("state.txt"),
+        "sequenceNumber=1712\ntimestamp=2026-11-01T00\\:03\\:30Z\n",
+    )
+    .unwrap();
+    Fixture {
+        replication: Replication::local(&diffs),
+        _dir: dir,
+        mirror,
+    }
+}
+
+/// The database's sequence.
+fn sequence(mirror: &Mirror) -> i64 {
+    mirror.state().unwrap().sequence
+}
+
+#[test]
+fn follow_applies_the_stream_in_batches_and_stops_when_up_to_date() {
+    let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
+        return;
+    };
+    let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
+    let f = fixture(&url);
+    let mut open = f.mirror.open().unwrap();
+    let opts = FollowOpts {
+        max_diffs: 2,
+        once: true,
+        ..FollowOpts::default()
+    };
+    let mut seen = Vec::new();
+    let stats = open
+        .follow(&f.replication, &opts, |_, batch| {
+            seen.push((batch.diffs, batch.sequence));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    assert_eq!(seen, [(2, 1710), (2, 1712)]);
+    assert_eq!(
+        (stats.batches, stats.diffs, stats.sequence, stats.stopped),
+        (2, 4, 1712, None)
+    );
+    assert_eq!(sequence(&f.mirror), 1712);
+    // Nothing is left, so another pass applies nothing
+    let again = open
+        .follow(&f.replication, &opts, |_, _| Ok::<_, io::Error>(()))
+        .unwrap();
+    assert_eq!((again.batches, again.stopped), (0, None));
+}
+
+#[test]
+fn follow_finishes_the_batch_and_then_stops_when_requested() {
+    let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
+        return;
+    };
+    let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
+    let f = fixture(&url);
+    let stop = Stop::new();
+    let opts = FollowOpts {
+        max_diffs: 1,
+        stop: stop.clone(),
+        ..FollowOpts::default()
+    };
+    let stats = f
+        .mirror
+        .open()
+        .unwrap()
+        .follow(&f.replication, &opts, |_, _| {
+            stop.request();
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    assert_eq!(
+        (stats.batches, stats.sequence, stats.stopped),
+        (1, 1709, Some(StopReason::Requested))
+    );
+    assert_eq!(sequence(&f.mirror), 1709);
+}
+
+#[test]
+fn a_time_limit_that_has_passed_applies_nothing() {
+    let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
+        return;
+    };
+    let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
+    let f = fixture(&url);
+    let stop = Stop::new().with_max_runtime(Duration::ZERO);
+    let opts = FollowOpts {
+        stop: stop.clone(),
+        ..FollowOpts::default()
+    };
+    let stats = f
+        .mirror
+        .open()
+        .unwrap()
+        .follow(&f.replication, &opts, |_, _| Ok::<_, io::Error>(()))
+        .unwrap();
+    assert_eq!(
+        (stats.batches, stats.sequence, stats.stopped),
+        (0, 1708, Some(StopReason::TimeLimit))
+    );
+
+    // An update stops the same way, and says why it did not reach the sequence it was asked for
+    let update = UpdateOpts {
+        stop,
+        ..UpdateOpts::default()
+    };
+    let stats = f.mirror.update(&f.replication, &update).unwrap();
+    assert_eq!(
+        (stats.batches, stats.sequence, stats.stopped),
+        (0, 1708, Some(StopReason::TimeLimit))
+    );
+    assert_eq!(sequence(&f.mirror), 1708);
+}
+
+#[test]
+fn an_update_that_reaches_its_sequence_has_no_stop_reason() {
+    let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
+        return;
+    };
+    let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
+    let f = fixture(&url);
+    let stats = f.mirror.update(&f.replication, &until(1710, 1)).unwrap();
+    assert_eq!(
+        (stats.batches, stats.sequence, stats.stopped),
+        (2, 1710, None)
+    );
+}
+
+#[test]
+fn follow_waits_for_newer_diffs_until_the_time_limit() {
+    let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
+        return;
+    };
+    let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
+    let f = fixture(&url);
+    let mut open = f.mirror.open().unwrap();
+    // Long enough for the one batch to start before it, even on a slow machine
+    let opts = FollowOpts {
+        wait: Duration::from_millis(20),
+        stop: Stop::new().with_max_runtime(Duration::from_secs(1)),
+        ..FollowOpts::default()
+    };
+    let stats = open
+        .follow(&f.replication, &opts, |_, _| Ok::<_, io::Error>(()))
+        .unwrap();
+    // It applied all four diffs, then waited and ended at the limit, up to date
+    assert_eq!(
+        (stats.diffs, stats.sequence, stats.stopped),
+        (4, 1712, None)
+    );
+}
+
+#[test]
+fn a_time_limit_that_passes_during_the_last_batch_ends_the_follow_up_to_date() {
+    let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
+        return;
+    };
+    let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
+    let f = fixture(&url);
+    let mut open = f.mirror.open().unwrap();
+    let stop = Stop::new().with_max_runtime(Duration::from_secs(1));
+    let opts = FollowOpts {
+        stop: stop.clone(),
+        ..FollowOpts::default()
+    };
+    let stats = open
+        .follow(&f.replication, &opts, |_, _| {
+            // The batch has every diff, and the limit passes before the loop looks again
+            while stop.reason().is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    assert_eq!(
+        (stats.batches, stats.sequence, stats.stopped),
+        (1, 1712, None)
+    );
+}
+
+#[test]
+fn an_error_after_a_batch_ends_the_follow_with_the_batch_committed() {
+    let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
+        return;
+    };
+    let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
+    let f = fixture(&url);
+    let opts = FollowOpts {
+        max_diffs: 1,
+        ..FollowOpts::default()
+    };
+    let err = f
+        .mirror
+        .open()
+        .unwrap()
+        .follow(&f.replication, &opts, |_, _| {
+            Err(io::Error::other("the derived tables failed"))
+        })
+        .unwrap_err();
+    assert!(matches!(err, FollowError::Batch(_)), "{err}");
+    assert_eq!(err.to_string(), "the derived tables failed");
+    assert_eq!(sequence(&f.mirror), 1709);
+}
 
 /// The node file rebuilt from the database has the locations the update gave the nodes of a way with a repeated
 /// point, in either format.
@@ -361,6 +586,7 @@ fn until(sequence: u64, max_diffs: u64) -> UpdateOpts {
     UpdateOpts {
         max_diffs,
         until: Some(sequence),
+        ..UpdateOpts::default()
     }
 }
 

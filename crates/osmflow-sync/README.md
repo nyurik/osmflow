@@ -90,6 +90,47 @@ its last version is written. Each batch:
    deletions, the change log, the batch and the new state, in one transaction;
 4. then commits the node file and the reverse index, with the new revision as their stamp.
 
+## Following the stream, and stopping
+
+[`OpenMirror::follow`] applies the diffs one batch at a time and keeps doing it as the stream grows: it waits for a
+newer diff when the database is up to date, or returns at once with [`FollowOpts::once`]. After each batch commits it
+calls a function of yours with the mirror and the batch's statistics, the place to update tables derived from the
+database before the next batch.
+
+A [`Stop`] ends it between batches, never in the middle of one, so the database and its files stay consistent. It
+asks when its time limit passes ([`Stop::with_max_runtime`]), when any thread calls [`Stop::request`], and with the
+`signals` feature on Ctrl+C, SIGTERM and SIGHUP (`Stop::on_signals`, while the guard it returns lives): the first
+signal finishes the batch in progress and stops; a second ends the process at once with exit status 130, rolling the
+batch back, and the next update repairs what it left half done, as after a crash. osmflow prints nothing itself: the
+function given to `on_signals` tells the user. [`UpdateOpts::stop`] gives a plain [`update`](Mirror::update) the same
+check, and [`UpdateStats::stopped`] says why either ended early.
+
+```rust,no_run
+use std::convert::Infallible;
+use std::time::Duration;
+
+use osmflow::osc::Replication;
+use osmflow_sync::{FollowOpts, Mirror, Stop};
+
+fn follow_for_twenty_minutes() -> Result<(), Box<dyn std::error::Error>> {
+    let mirror = Mirror::new("postgresql://postgres@localhost/osm", "osm-files");
+    let replication = Replication::local("district-of-columbia-updates");
+    let opts = FollowOpts {
+        stop: Stop::new().with_max_runtime(Duration::from_secs(20 * 60)),
+        ..FollowOpts::default()
+    };
+    let stats = mirror.open()?.follow(&replication, &opts, |_mirror, batch| {
+        println!("applied {} diffs, now at sequence {}", batch.diffs, batch.sequence);
+        Ok::<(), Infallible>(())
+    })?;
+    match stats.stopped {
+        None => println!("up to date at sequence {}", stats.sequence),
+        Some(reason) => println!("stopped early at sequence {}: {reason:?}", stats.sequence),
+    }
+    Ok(())
+}
+```
+
 ## The files after a crash, and when they are lost
 
 The database commits first, and the two files after it, so a file is never ahead of the database. Each file carries

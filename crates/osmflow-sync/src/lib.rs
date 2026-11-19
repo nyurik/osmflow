@@ -4,10 +4,12 @@ mod copy;
 mod db;
 mod error;
 mod files;
+mod follow;
 mod import;
 mod index;
 mod rebuild;
 mod sort;
+mod stop;
 mod update;
 
 use std::path::{Path, PathBuf};
@@ -20,8 +22,12 @@ use postgres::Client;
 
 pub use crate::db::{DbState, GeometryFormat};
 pub use crate::error::SyncError;
+pub use crate::follow::{FollowError, FollowOpts};
 pub use crate::import::{ImportOpts, ImportStats};
 pub use crate::rebuild::{Rebuild, RebuildStats};
+#[cfg(feature = "signals")]
+pub use crate::stop::{Signal, SignalError, SignalGuard};
+pub use crate::stop::{Stop, StopReason};
 pub use crate::update::{UpdateOpts, UpdateStats};
 
 /// A database kept current from replication, and the directory of its node file and reverse index.
