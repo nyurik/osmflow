@@ -167,7 +167,7 @@ impl DbState {
         }
         Ok(Self {
             id: row.get(0),
-            rev: row.get(2),
+            rev: row.get::<_, i32>(2).into(),
             url: row.get(3),
             sequence: row.get(4),
             timestamp: row.get::<_, Option<i64>>(5).map(Timestamp::from_millis),
@@ -205,10 +205,10 @@ impl Table {
     /// The table's columns, in the order rows are encoded, as a list for SQL: `id` first, then the rest after `, `.
     pub(crate) fn columns(self) -> &'static str {
         match self {
-            Self::Nodes => "id, version, changeset, ts, rev, tags, geom",
-            Self::Ways => "id, version, changeset, ts, minor, rev, tags, nodes, geom",
+            Self::Nodes => "id, changeset, ts, version, rev, tags, geom",
+            Self::Ways => "id, changeset, ts, version, minor, rev, tags, nodes, geom",
             Self::Relations => {
-                "id, version, changeset, ts, rev, tags, member_types, member_ids, member_roles"
+                "id, changeset, ts, version, rev, tags, member_types, member_ids, member_roles"
             }
         }
     }

@@ -82,6 +82,7 @@ fn import_update_rebuild_as(url: &str, storage: Storage) {
     let mut db = Client::connect(url, NoTls).unwrap();
     assert_eq!(mirror.state().unwrap().storage, storage);
     check_geometry(&mut db, storage);
+    check_metadata(&mut db);
     write_diffs(&diffs, &mut db);
 
     // A stream whose diff 1708 is at another time is not the database's
@@ -733,7 +734,32 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-fn minor_rev(db: &mut Client, id: i64) -> (i32, i64) {
+/// The metadata columns of a node, a way and a relation just imported, as `dump --metadata` shows them in the
+/// fixture; the file has no changesets.
+fn check_metadata(db: &mut Client) {
+    let ts = "to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')";
+    for (table, id, version, time) in [
+        ("nodes", 2_205_706_315_i64, 8, "2020-11-09T19:34:27Z"),
+        ("ways", 178_300_745, 4, "2025-01-16T08:49:46Z"),
+        ("relations", 11980, 752, "2024-05-25T19:42:49Z"),
+    ] {
+        let row = db
+            .query_one(
+                &format!("SELECT version, changeset, {ts}, rev FROM osm.{table} WHERE id = $1"),
+                &[&id],
+            )
+            .unwrap();
+        let got: (i32, Option<i64>, String, i32) = (row.get(0), row.get(1), row.get(2), row.get(3));
+        assert_eq!(got, (version, None, time.to_owned(), 1), "{table} {id}");
+    }
+    let minor: i32 = db
+        .query_one("SELECT minor FROM osm.ways WHERE id = 178300745", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(minor, 0);
+}
+
+fn minor_rev(db: &mut Client, id: i64) -> (i32, i32) {
     let row = db
         .query_one("SELECT minor, rev FROM osm.ways WHERE id = $1", &[&id])
         .unwrap();
@@ -754,7 +780,7 @@ fn rows(db: &mut Client) -> Vec<String> {
 }
 
 /// The change log of revision `rev`.
-fn changes(db: &mut Client, rev: i64) -> Vec<(String, i64, String)> {
+fn changes(db: &mut Client, rev: i32) -> Vec<(String, i64, String)> {
     db.query(
         "SELECT kind::text, id, action::text FROM osm.changes WHERE rev = $1 ORDER BY 1, 2",
         &[&rev],

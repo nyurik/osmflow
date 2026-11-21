@@ -165,7 +165,8 @@ fn apply_diffs(
         let (changes, last_state) = read_diffs(replication, next..=last)?;
         let read = t.elapsed();
         let batch = Batch {
-            rev: state.rev + 1,
+            rev: i32::try_from(state.rev + 1)
+                .map_err(|_| SyncError::state("the database's revisions are used up"))?,
             first: next.cast_signed(),
             last: last.cast_signed(),
             timestamp: last_state.map(|s| s.timestamp),
@@ -182,7 +183,7 @@ fn apply_diffs(
             secs = t.elapsed().as_secs_f32(),
             "applied a batch"
         );
-        state.rev = batch.rev;
+        state.rev = batch.rev.into();
         total.batches += 1;
         total.diffs += last + 1 - next;
         total.rows += applied.rows;
@@ -235,7 +236,7 @@ pub(crate) fn check_stream(state: &DbState, replication: &Replication) -> Result
 
 /// One transaction's place in the stream.
 struct Batch {
-    rev: i64,
+    rev: i32,
     first: i64,
     last: i64,
     timestamp: Option<Timestamp>,
@@ -302,8 +303,8 @@ fn apply(
     let rows = write(client, changes, &plan, batch)?;
     let written = t.elapsed();
     // The database is committed; the files follow it, and catch up on the next start if a crash comes first
-    store.commit(batch.rev.cast_unsigned())?;
-    index.apply(&plan.remove, &plan.add, batch.rev)?;
+    store.commit(u64::from(batch.rev.cast_unsigned()))?;
+    index.apply(&plan.remove, &plan.add, batch.rev.into())?;
     debug!(
         moved_nodes = moved.len(),
         read_secs = read.as_secs_f32(),
@@ -433,11 +434,11 @@ fn write(
             )?
         };
         for row in &gone {
-            log.row(4).i64(rev).char(kind).i64(row.get(0)).char(b'd');
+            log.row(4).i64(row.get(0)).i32(rev).char(kind).char(b'd');
         }
         upsert(&mut tx, table, format, &w.rows)?;
         for &id in &w.written {
-            log.row(4).i64(rev).char(kind).i64(id).char(b'u');
+            log.row(4).i64(id).i32(rev).char(kind).char(b'u');
         }
         rows += gone.len() as u64 + w.rows.count;
     }
@@ -451,11 +452,11 @@ fn write(
             &[&rev],
         )?;
         for &id in &plan.moved_ways {
-            log.row(4).i64(rev).char(b'w').i64(id).char(b'g');
+            log.row(4).i64(id).i32(rev).char(b'w').char(b'g');
         }
     }
     if log.count > 0 {
-        db::copy(&mut tx, "osm.changes", "rev, kind, id, action", &log)?;
+        db::copy(&mut tx, "osm.changes", "id, rev, kind, action", &log)?;
     }
     let timestamp = batch.timestamp.map(Timestamp::as_millis);
     let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);

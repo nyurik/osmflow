@@ -77,14 +77,14 @@ impl Rows {
         &mut self,
         id: i64,
         meta: Meta,
-        rev: i64,
+        rev: i32,
         tags: impl Iterator<Item = (&'a str, &'a str)>,
         loc: Option<Location>,
     ) {
         self.row(7)
             .i64(id)
             .meta(meta)
-            .i64(rev)
+            .i32(rev)
             .tags(tags)
             .point(loc);
     }
@@ -94,7 +94,7 @@ impl Rows {
         &mut self,
         id: i64,
         meta: Meta,
-        rev: i64,
+        rev: i32,
         tags: impl Iterator<Item = (&'a str, &'a str)>,
         nodes: impl ExactSizeIterator<Item = i64>,
         line: Option<&[Location]>,
@@ -103,7 +103,7 @@ impl Rows {
             .i64(id)
             .meta(meta)
             .i32(0)
-            .i64(rev)
+            .i32(rev)
             .tags(tags)
             .way_nodes(nodes)
             .line(line);
@@ -114,14 +114,14 @@ impl Rows {
         &mut self,
         id: i64,
         meta: Meta,
-        rev: i64,
+        rev: i32,
         tags: impl Iterator<Item = (&'a str, &'a str)>,
         members: impl ExactSizeIterator<Item = Member<'a>> + Clone,
     ) {
         self.row(9)
             .i64(id)
             .meta(meta)
-            .i64(rev)
+            .i32(rev)
             .tags(tags)
             .members(members);
     }
@@ -157,18 +157,18 @@ impl Rows {
         self
     }
 
-    /// The version, changeset and timestamp columns.
+    /// The changeset, timestamp and version columns.
     pub(crate) fn meta(&mut self, meta: Meta) -> &mut Self {
-        match meta.version {
-            Some(v) => self.i32(v),
-            None => self.null(),
-        };
         match meta.changeset {
             Some(c) => self.i64(c),
             None => self.null(),
         };
         match meta.timestamp {
             Some(t) => self.i64((t.as_millis() - PG_EPOCH_MS) * 1000),
+            None => self.null(),
+        };
+        match meta.version {
+            Some(v) => self.i32(v),
             None => self.null(),
         }
     }

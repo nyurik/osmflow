@@ -21,7 +21,7 @@ use crate::sort::Sorter;
 use crate::{Mirror, Storage, SyncError};
 
 /// The revision of the imported data.
-pub(crate) const IMPORT_REV: i64 = 1;
+pub(crate) const IMPORT_REV: i32 = 1;
 
 /// How to import.
 #[derive(Debug, Clone)]
@@ -140,7 +140,7 @@ pub(crate) fn import(
             ReverseIndex::create(
                 &m.index_path(),
                 id,
-                IMPORT_REV,
+                IMPORT_REV.into(),
                 sorted.map(|p| p.map_err(SyncError::from)),
             )
         });
@@ -155,7 +155,7 @@ pub(crate) fn import(
     stats.pairs = index?.1;
     tables?;
     store.set_metadata(ID_KEY, &id.to_le_bytes())?;
-    store.commit(IMPORT_REV.cast_unsigned())?;
+    store.commit(u64::from(IMPORT_REV.cast_unsigned()))?;
     info!(
         pairs = stats.pairs,
         secs = t.elapsed().as_secs_f32(),
@@ -164,7 +164,7 @@ pub(crate) fn import(
 
     let position = DbState {
         id,
-        rev: IMPORT_REV,
+        rev: IMPORT_REV.into(),
         url,
         sequence,
         timestamp,
@@ -182,7 +182,7 @@ fn record(client: &mut Client, at: &DbState, loaded: &ImportStats) -> Result<(),
         "INSERT INTO osm.batches (rev, first_sequence, last_sequence, timestamp, nodes, ways, relations) \
          VALUES ($1, $2, $2, to_timestamp($3::int8 / 1000.0), $4, $5, $6)",
         &[
-            &at.rev,
+            &IMPORT_REV,
             &at.sequence,
             &timestamp,
             &loaded.tagged_nodes.cast_signed(),
@@ -196,7 +196,7 @@ fn record(client: &mut Client, at: &DbState, loaded: &ImportStats) -> Result<(),
         &[
             &at.id,
             &SCHEMA_VERSION,
-            &at.rev,
+            &IMPORT_REV,
             &at.url,
             &at.sequence,
             &timestamp,

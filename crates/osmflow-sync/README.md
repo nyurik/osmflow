@@ -35,10 +35,10 @@ fn import_and_update() -> Result<(), Box<dyn std::error::Error>> {
 
 | What | Where | Holds |
 |---|---|---|
-| `osm.nodes` | the database | tagged nodes: `id, version, changeset, ts, rev, tags jsonb, geom` (a point); a view over `osm.nodes_packed` when packed |
+| `osm.nodes` | the database | tagged nodes: `id, changeset, ts, version, rev, tags jsonb, geom` (a point); a view over `osm.nodes_packed` when packed |
 | `osm.ways` | the database | every way: the same, with `minor`, `nodes int8[]` and `geom` (a line string with a point per node); a view over `osm.ways_packed` when packed, whose `nodes` is a `bytea` |
 | `osm.relations` | the database | every relation: the same, with `member_types`, `member_ids` and `member_roles` |
-| `osm.changes` | the database | each row change after the import: `rev, kind, id, action` |
+| `osm.changes` | the database | each row change after the import: `id, rev, kind, action` |
 | `osm.batches`, `osm.state` | the database | each revision's sequences, and where the database is in its stream |
 | `nodes.cache` | the directory | every node's location, a [`PagedStore`](https://docs.rs/osmflow/latest/osmflow/nodes/struct.PagedStore.html): about 5 bytes per node |
 | `ways.redb` | the directory | the reverse index: the ways through each node, in a [`redb`](https://www.redb.org) file |
