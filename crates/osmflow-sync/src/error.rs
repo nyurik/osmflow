@@ -34,6 +34,9 @@ pub enum SyncError {
     /// Another I/O error.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// The connection string's `sslmode` or `sslrootcert` cannot be used.
+    #[error(transparent)]
+    Tls(#[from] crate::TlsError),
     /// The database, its files and the input do not fit together, as the message says.
     #[error("{0}")]
     State(String),

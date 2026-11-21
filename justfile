@@ -15,7 +15,11 @@ dist_dir := 'target/dist'
 dist_build := 'cargo build --release --locked --package osmflow-cli --bin osmflow --target'
 # The database of the tests of `osmflow-sync` and `osmflow sync`, in the Docker container `test-db-up` starts. The tests
 # replace its `osm` schema.
-test_db := 'postgresql://postgres@localhost:5434/postgres'
+test_db := 'postgresql://postgres@localhost:5435/postgres'
+# The certificates of that database's TLS, which `test-db-up` makes
+test_db_tls := justfile_directory() / 'target/test-db-tls'
+# The environment of the tests that use the database
+test_db_env := 'OSMFLOW_SYNC_TEST_DB=' + quote(test_db) + ' OSMFLOW_SYNC_TEST_TLS=' + quote(test_db_tls)
 
 # if running in CI, treat warnings as errors by setting CARGO_BUILD_WARNINGS to 'deny' unless it is already set
 # Use `CI=true just ci-test` to run the same tests as in GitHub CI.
@@ -47,7 +51,7 @@ check:
 ci-coverage: env-info test-db-up
     rm -rf {{quote(parent_directory(coverage_lcov))}}
     mkdir -p {{quote(parent_directory(coverage_lcov))}}
-    OSMFLOW_SYNC_TEST_DB={{quote(test_db)}} {{just}} _coverage --lcov --output-path {{quote(coverage_lcov)}}
+    {{test_db_env}} {{just}} _coverage --lcov --output-path {{quote(coverage_lcov)}}
 
 # Find copy/pasted code, marking clones absent from base_ref as new, and write a Markdown summary for the PR comment
 ci-cpd base_ref='origin/main':  (assert-cmd 'jq') (cpd '--reporters' 'console,json' '--output' cpd_output '--baseline-from-ref' base_ref)
@@ -211,19 +215,47 @@ test:
 # Test documentation generation
 test-doc:  (docs '')
 
-# The container is `osmflow-sync-pg`, on port 5434.
+# The container is `osmflow-sync-pg-tls`, on port 5435. It has TLS, with a certificate for `localhost` issued by
+# `test_db_tls`'s `ca.crt`; `other.crt` issued nothing. The role `osmflow_tls` may connect only with TLS.
 # Start PostgreSQL 18 with PostGIS in Docker for the database tests, unless it is running
-test-db-up:  (assert-cmd 'docker')
-    docker start osmflow-sync-pg 2>/dev/null || docker run -d --name osmflow-sync-pg -p 5434:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgis/postgis:18-3.6-alpine
-    until docker exec osmflow-sync-pg pg_isready -h localhost -U postgres -q; do sleep 1; done
+test-db-up:  (assert-cmd 'docker') (assert-cmd 'openssl')
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir={{quote(test_db_tls)}}
+    if [ ! -f "$dir/init.sh" ]; then
+        docker rm -f osmflow-sync-pg-tls >/dev/null 2>&1 || true
+        mkdir -p "$dir"
+        cd "$dir"
+        ec=(-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes)
+        for ca in ca other; do
+            openssl req -x509 "${ec[@]}" -days 36500 -subj "/CN=osmflow test $ca" -keyout $ca.key -out $ca.crt 2>/dev/null
+        done
+        openssl req "${ec[@]}" -subj /CN=localhost -keyout server.key -out server.csr 2>/dev/null
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 36500 -out server.crt \
+            -extfile <(echo subjectAltName=DNS:localhost) 2>/dev/null
+        # The container's postgres user reads it, and keeps a copy only it may read
+        chmod 644 server.key
+        cat > init.sh <<'EOF'
+    cp /tls/server.crt /tls/server.key "$PGDATA/"
+    chmod 600 "$PGDATA/server.key"
+    echo 'ssl = on' >> "$PGDATA/postgresql.conf"
+    { echo 'hostnossl all osmflow_tls all reject'; cat "$PGDATA/pg_hba.conf"; } > /tmp/pg_hba.conf
+    cat /tmp/pg_hba.conf > "$PGDATA/pg_hba.conf"
+    psql -v ON_ERROR_STOP=1 -U postgres -c 'CREATE ROLE osmflow_tls LOGIN'
+    EOF
+    fi
+    docker start osmflow-sync-pg-tls >/dev/null 2>&1 || docker run -d --name osmflow-sync-pg-tls -p 5435:5432 \
+        -e POSTGRES_HOST_AUTH_METHOD=trust -v "$dir:/tls:ro" -v "$dir/init.sh:/docker-entrypoint-initdb.d/tls.sh:ro" \
+        postgis/postgis:18-3.6-alpine
+    until docker exec osmflow-sync-pg-tls pg_isready -h localhost -U postgres -q; do sleep 1; done
 
-# Run osmflow-sync's database test against PostGIS in Docker (`test-db-up`)
+# Run osmflow-sync's tests, those of the database included, against PostGIS in Docker (`test-db-up`)
 test-sync-db *args:  test-db-up
-    OSMFLOW_SYNC_TEST_DB={{quote(test_db)}} cargo test -p osmflow-sync --test sync {{args}}
+    {{test_db_env}} cargo test -p osmflow-sync --all-features {{args}}
 
 # Run all tests, those of `osmflow-sync` and `osmflow sync` against PostGIS in Docker (`test-db-up`)
 test-with-db:  test-db-up
-    OSMFLOW_SYNC_TEST_DB={{quote(test_db)}} {{just}} test
+    {{test_db_env}} {{just}} test
 
 # Test code formatting
 test-fmt: && (fmt-toml '--check' '--check-format')

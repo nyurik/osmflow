@@ -1,5 +1,5 @@
 //! Imports, updates and rebuilds against the database `OSMFLOW_SYNC_TEST_DB` names, such as
-//! `postgresql://postgres@localhost:5434/postgres` (`just test-sync-db` starts one). Its `osm` schema is replaced.
+//! `postgresql://postgres@localhost:5435/postgres` (`just test-sync-db` starts one). Its `osm` schema is replaced.
 //! Without it, the test does nothing.
 
 use std::fmt::Write as _;

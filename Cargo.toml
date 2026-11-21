@@ -47,6 +47,8 @@ osmflow = { path = "crates/osmflow", version = "0.15.0" }
 osmflow-sync = { path = "crates/osmflow-sync", version = "0.14.1" }
 osmpbf = { version = "0.3.8", default-features = false }
 osmpbfreader = "0.19"
+# Decoding `sslmode` and `sslrootcert` in a connection URL
+percent-encoding = "2.3.1"
 postgres = "0.19.14"
 rand = "0.10"
 # 1.7 is the first with `ThreadPool::yield_now`
@@ -55,6 +57,10 @@ redb = "4.5"
 regex = "1.11"
 # On Linux, for the PBF reader: `fadvise` to keep a large file from crowding the page cache, `sysinfo` for the memory
 rustix = { version = "1.1", default-features = false, features = ["fs", "std", "system"] }
+# TLS for PostgreSQL connections, with ring as ureq has it: no C toolchain beyond what ring needs for the musl targets
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
+# The system's trusted certificates, for `sslmode=verify-full` without `sslrootcert`
+rustls-native-certs = "0.8"
 # Already built for tracing-subscriber's JSON logs; the CLI writes JSON strings with it
 serde_json = "1.0.140"
 # Names of enum values, and parsing them, derived
@@ -62,6 +68,7 @@ strum = { version = "0.28", features = ["derive"] }
 tempfile = "3.20"
 test_each_file = "0.3.5"
 thiserror = "2"
+tokio-postgres-rustls = "0.14"
 # Without its `attributes` feature, so no proc macros: spans are made with the macros
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry", "std", "tracing-log"] }

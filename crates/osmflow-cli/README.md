@@ -219,7 +219,11 @@ Keeps OpenStreetMap data in PostgreSQL with PostGIS, with the
 [`osmflow-sync`](https://github.com/nyurik/osmflow/tree/main/crates/osmflow-sync) crate: it imports a PBF file into the
 database's `osm` schema, applies the replication diffs after it, and makes the two files kept beside the database
 again when they are lost. Every command takes the database as `--db` or `DATABASE_URL`, and the directory of the
-files as `--dir` or `OSMFLOW_SYNC_DIR`.
+files as `--dir` or `OSMFLOW_SYNC_DIR`. Connections use TLS as the database's `sslmode` asks, as with libpq: `prefer`
+by default, which encrypts when the server can, `require`, which always does, or `verify-full`, which also checks the
+server's certificate against the authorities in `sslrootcert`, as in
+`postgresql://user@host/osm?sslmode=verify-full&sslrootcert=db-ca.pem`; the
+[crate's docs](https://github.com/nyurik/osmflow/tree/main/crates/osmflow-sync#connections) list every mode.
 
 ```sh
 export DATABASE_URL=postgresql://postgres@localhost/osm OSMFLOW_SYNC_DIR=dc-files

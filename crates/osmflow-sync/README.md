@@ -146,6 +146,28 @@ the database's identity, a random number made by the import, and the revision it
   every tagged node; or from a PBF file, such as a new download, and the diffs after it up to the database's sequence,
   which gives every node. The reverse index always comes from the database.
 
+## Connections
+
+The database is given as libpq takes it: `postgresql://user:password@host:port/db?param=value`, or
+`host=… user=… dbname=…`. Connections use TLS as its `sslmode` parameter asks, with
+[rustls](https://crates.io/crates/rustls), as libpq does:
+
+| `sslmode` | TLS | The server's certificate |
+|---|---|---|
+| `disable` | never | |
+| `prefer`, the default | if the server has it | not checked |
+| `require` | always | not checked, unless `sslrootcert` is given: then as `verify-ca` |
+| `verify-ca` | always | issued by an authority in `sslrootcert`, for any host name |
+| `verify-full` | always | issued by an authority in `sslrootcert`, or the system's without it, for the host connected to |
+
+`sslrootcert` is a PEM file of the certificate authorities to trust, such as the bundle a cloud provider publishes for
+its managed databases: `postgresql://user@host/osm?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem`. `prefer` and
+`require` encrypt the connection, but cannot tell the server from another that answers in its place; `verify-full`
+can. `verify-ca` needs `sslrootcert`, as the system's authorities would accept a certificate for any host. libpq's
+`allow`, client certificates (`sslcert`, `sslkey`) and its environment variables (`PGSSLMODE` and the others) are not
+supported, nor is its `sslrootcert=system`: `verify-full` without `sslrootcert` uses the system's authorities, where
+libpq would read `~/.postgresql/root.crt`, which is never read here.
+
 ## Performance
 
 Measured on a laptop (16 cores, NVMe disk) with PostgreSQL 18 and PostGIS 3.6 in Docker on the same machine, its
@@ -168,7 +190,6 @@ Measured on a laptop (16 cores, NVMe disk) with PostgreSQL 18 and PostGIS 3.6 in
 
 ## Limits
 
-* Connections are not encrypted.
 * The import and the rebuilds sort the reverse index's (node, way) pairs, and a rebuild from the database its node
   locations, 16 bytes each, in runs of 1 GiB sorted on all cores, written to temporary files in the directory and
   merged, with at most three runs in memory: District of Columbia's 2.3 million pairs fit in one run in memory, and the planet's 13 billion would
