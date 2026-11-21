@@ -11,7 +11,7 @@ use postgres::{Client, Transaction};
 use tracing::{debug, info, warn};
 
 use crate::copy::Rows;
-use crate::db::{self, DbState, Table};
+use crate::db::{self, DbState, NodeIds, Table};
 use crate::files::{read_diffs, set_locations, way_pairs};
 use crate::index::{Pair, ReverseIndex};
 use crate::{OpenMirror, Stop, StopReason, SyncError, TableLayout};
@@ -295,7 +295,7 @@ fn apply(
             &[&ids],
         )?
         .iter()
-        .map(|r| (r.get(0), tables.node_ids(r, 1)))
+        .map(|r| (r.get(0), r.get::<_, NodeIds>(1).0))
         .collect();
     let read = t.elapsed();
     let plan = plan(store, changes, &through, &old, batch);

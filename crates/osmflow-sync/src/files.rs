@@ -11,7 +11,7 @@ use osmflow::nodes::prelude::*;
 use osmflow::osc::{Replication, State};
 use tracing::info;
 
-use crate::db::{DbState, Table};
+use crate::db::{DbState, NodeIds, Table};
 use crate::index::Pair;
 use crate::update::Changes;
 use crate::{OpenMirror, SyncError};
@@ -113,7 +113,7 @@ impl OpenMirror {
         )?;
         let mut add: Vec<Pair> = Vec::new();
         for row in rows {
-            add.extend(way_pairs(row.get(0), &state.tables.node_ids(&row, 1)));
+            add.extend(way_pairs(row.get(0), &row.get::<_, NodeIds>(1).0));
         }
         add.sort_unstable();
         add.dedup();

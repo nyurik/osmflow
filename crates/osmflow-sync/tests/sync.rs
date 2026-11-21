@@ -13,8 +13,8 @@ use osmflow::nodes::PagedStore;
 use osmflow::nodes::prelude::*;
 use osmflow::osc::Replication;
 use osmflow_sync::{
-    FileStamp, FollowError, FollowOpts, ImportOpts, Mirror, NodeWay, Rebuild, Stop, StopReason,
-    TableLayout, UpdateOpts,
+    FileStamp, FollowError, FollowOpts, ImportOpts, Mirror, NodeIds, NodeWay, Rebuild, Stop,
+    StopReason, TableLayout, UpdateOpts,
 };
 use postgres::{Client, NoTls};
 
@@ -585,6 +585,18 @@ fn check_geometry(db: &mut Client, tables: TableLayout) {
                     .unwrap()
                     .get(0);
                 assert_eq!(ids, expected, "{hex}");
+            }
+            // `NodeIds` decodes the stored bytes to the view's lists, and reads the view's `int8[]` too
+            let rows = db
+                .query(
+                    "SELECT p.nodes, w.nodes FROM osm.ways_packed p JOIN osm.ways w USING (id)",
+                    &[],
+                )
+                .unwrap();
+            assert!(!rows.is_empty());
+            for row in rows {
+                let (packed, plain): (NodeIds, NodeIds) = (row.get(0), row.get(1));
+                assert_eq!(packed, plain);
             }
             "osm.ways_packed USING gist (osm.geom(geom))"
         }

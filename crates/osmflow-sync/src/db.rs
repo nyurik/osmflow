@@ -1,11 +1,13 @@
 //! The database side: connections, the state row, and writing rows with binary `COPY` on several connections.
 
+use std::error::Error;
 use std::io::Write as _;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use osmflow::Timestamp;
-use postgres::{CopyInWriter, GenericClient, Row};
+use postgres::types::{FromSql, Type};
+use postgres::{CopyInWriter, GenericClient};
 
 use crate::SyncError;
 use crate::copy::{HEADER, Rows, TRAILER};
@@ -62,7 +64,7 @@ pub enum TableLayout {
     /// one before (the first from 0), zigzag-encoded and written as an LEB128 varint: 6.0 MB against 25.9 MB as an
     /// `int8[]` in the District of Columbia, 17.6 MB against 86.7 MB in New York City (PostgreSQL 18 in Docker on a
     /// laptop). `osm.node_ids` decodes about 1.3 µs per node, 9.1 s for all ways of New York City against 0.28 s for
-    /// reading an `int8[]`, so bulk readers should read `osm.ways_packed` and decode the bytes themselves.
+    /// reading an `int8[]`, so bulk readers should read `osm.ways_packed` and decode the bytes with [`NodeIds`].
     #[default]
     Packed,
     /// PostGIS's `geometry` with SRID 4326, stored as WKB, and `nodes` as an `int8[]`, in the tables `osm.nodes` and
@@ -130,13 +132,34 @@ impl TableLayout {
             },
         }
     }
+}
 
-    /// The node IDs of a way, from its `nodes` column in the table that stores it.
-    pub(crate) fn node_ids(self, row: &Row, column: usize) -> Vec<i64> {
-        match self {
-            Self::Packed => unpack_ids(row.get(column)),
-            Self::Plain => row.get(column),
+/// A way's node IDs from its `nodes` column, in either layout: a packed `bytea` (`osm.ways_packed`, decoded here, far
+/// faster than `osm.node_ids` in SQL) or an `int8[]` (`osm.ways`). With binary `COPY`, declare the column's type as it
+/// is: `bytea` when the table is packed, `int8[]` otherwise.
+///
+/// ```
+/// use osmflow_sync::NodeIds;
+/// use postgres::types::{FromSql, Type};
+///
+/// // Steps 100, +1, -2, +300, each zigzagged and written as a varint
+/// let ids = NodeIds::from_sql(&Type::BYTEA, &[0xc8, 0x01, 0x02, 0x03, 0xd8, 0x04]).unwrap();
+/// assert_eq!(ids.0, [100, 101, 99, 399]);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeIds(pub Vec<i64>);
+
+impl<'a> FromSql<'a> for NodeIds {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        if *ty == Type::BYTEA {
+            Ok(Self(unpack_ids(raw)))
+        } else {
+            Vec::from_sql(ty, raw).map(Self)
         }
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::BYTEA || *ty == Type::INT8_ARRAY
     }
 }
 
