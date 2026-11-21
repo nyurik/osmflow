@@ -513,8 +513,11 @@ mod tests {
             return;
         };
         let config: Config = url.parse().unwrap();
-        let Host::Tcp(host) = &config.get_hosts()[0] else {
-            panic!("{url} is not on TCP");
+        // Windows has no `Host::Unix`
+        let host = match &config.get_hosts()[0] {
+            Host::Tcp(host) => host,
+            #[cfg(unix)]
+            Host::Unix(_) => panic!("{url} is not on TCP"),
         };
         let port = config.get_ports()[0];
         let ca = Path::new(&certs).join("ca.crt");
