@@ -44,7 +44,7 @@ memchr = "2.7"
 memmap2 = "0.9"
 osm-bench = { path = "benches/common" }
 osmflow = { path = "crates/osmflow", version = "0.15.0" }
-osmflow-sync = { path = "crates/osmflow-sync", version = "0.15.0" }
+osmflow-sync = { path = "crates/osmflow-sync", version = "0.16.0" }
 osmpbf = { version = "0.3.8", default-features = false }
 osmpbfreader = "0.19"
 # Decoding `sslmode` and `sslrootcert` in a connection URL

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/nyurik/osmflow/compare/osmflow-sync-v0.15.0...osmflow-sync-v0.16.0) - 2026-11-21
+
+### Added
+
+- *(sync)* [**breaking**] packed tables (TWKB geometry, varint node lists) behind views `osm.nodes` and `osm.ways` ([#70](https://github.com/nyurik/osmflow/pull/70))
+
 ## [0.15.0](https://github.com/nyurik/osmflow/compare/osmflow-sync-v0.14.1...osmflow-sync-v0.15.0) - 2026-11-21
 
 ### Added
