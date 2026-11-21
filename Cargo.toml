@@ -53,7 +53,7 @@ postgres = "0.19.14"
 rand = "0.10"
 # 1.7 is the first with `ThreadPool::yield_now`
 rayon = "1.7"
-redb = "4.5"
+redb = "5.0"
 regex = "1.11"
 # On Linux, for the PBF reader: `fadvise` to keep a large file from crowding the page cache, `sysinfo` for the memory
 rustix = { version = "1.1", default-features = false, features = ["fs", "std", "system"] }
