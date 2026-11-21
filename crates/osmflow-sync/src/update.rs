@@ -14,7 +14,7 @@ use crate::copy::Rows;
 use crate::db::{self, DbState, Table};
 use crate::files::{read_diffs, set_locations, way_pairs};
 use crate::index::{Pair, ReverseIndex};
-use crate::{GeometryFormat, OpenMirror, Stop, StopReason, SyncError};
+use crate::{OpenMirror, Stop, StopReason, SyncError, TableLayout};
 
 /// How to update.
 #[derive(Debug, Clone)]
@@ -121,7 +121,7 @@ impl OpenMirror {
         // database did not commit, so the file is opened again on the next update
         let mut store = self.take_node_file(&state, replication)?;
         if !self.temp_tables {
-            create_temp_tables(&mut self.client)?;
+            create_temp_tables(&mut self.client, state.tables)?;
             self.temp_tables = true;
         }
         let total = apply_diffs(
@@ -165,11 +165,12 @@ fn apply_diffs(
         let (changes, last_state) = read_diffs(replication, next..=last)?;
         let read = t.elapsed();
         let batch = Batch {
-            rev: state.rev + 1,
+            rev: i32::try_from(state.rev + 1)
+                .map_err(|_| SyncError::state("the database's revisions are used up"))?,
             first: next.cast_signed(),
             last: last.cast_signed(),
             timestamp: last_state.map(|s| s.timestamp),
-            geometry: state.geometry,
+            tables: state.tables,
         };
         let applied = apply(client, store, index, &changes, &batch)?;
         info!(
@@ -182,7 +183,7 @@ fn apply_diffs(
             secs = t.elapsed().as_secs_f32(),
             "applied a batch"
         );
-        state.rev = batch.rev;
+        state.rev = batch.rev.into();
         total.batches += 1;
         total.diffs += last + 1 - next;
         total.rows += applied.rows;
@@ -235,11 +236,11 @@ pub(crate) fn check_stream(state: &DbState, replication: &Replication) -> Result
 
 /// One transaction's place in the stream.
 struct Batch {
-    rev: i64,
+    rev: i32,
     first: i64,
     last: i64,
     timestamp: Option<Timestamp>,
-    geometry: GeometryFormat,
+    tables: TableLayout,
 }
 
 /// Rows to write into a table, and IDs to delete from it.
@@ -283,10 +284,18 @@ fn apply(
         .collect();
     ids.sort_unstable();
     ids.dedup();
+    let tables = batch.tables;
+    // From the stored table, decoded here: `osm.node_ids` is far slower
     let old: HashMap<i64, Vec<i64>> = client
-        .query("SELECT id, nodes FROM osm.ways WHERE id = ANY($1)", &[&ids])?
-        .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
+        .query(
+            &format!(
+                "SELECT id, nodes FROM {} WHERE id = ANY($1)",
+                Table::Ways.name(tables)
+            ),
+            &[&ids],
+        )?
+        .iter()
+        .map(|r| (r.get(0), tables.node_ids(r, 1)))
         .collect();
     let read = t.elapsed();
     let plan = plan(store, changes, &through, &old, batch);
@@ -294,8 +303,8 @@ fn apply(
     let rows = write(client, changes, &plan, batch)?;
     let written = t.elapsed();
     // The database is committed; the files follow it, and catch up on the next start if a crash comes first
-    store.commit(batch.rev.cast_unsigned())?;
-    index.apply(&plan.remove, &plan.add, batch.rev)?;
+    store.commit(u64::from(batch.rev.cast_unsigned()))?;
+    index.apply(&plan.remove, &plan.add, batch.rev.into())?;
     debug!(
         moved_nodes = moved.len(),
         read_secs = read.as_secs_f32(),
@@ -320,11 +329,11 @@ fn plan(
     old: &HashMap<i64, Vec<i64>>,
     batch: &Batch,
 ) -> Plan {
-    let (rev, format) = (batch.rev, batch.geometry);
+    let (rev, layout) = (batch.rev, batch.tables);
     let mut plan = Plan::default();
-    plan.nodes.rows = Rows::new(format);
-    plan.ways.rows = Rows::new(format);
-    plan.geoms = Rows::new(format);
+    plan.nodes.rows = Rows::new(layout);
+    plan.ways.rows = Rows::new(layout);
+    plan.geoms = Rows::new(layout);
     for (&id, (deleted, w)) in &changes.ways {
         if let Some(nodes) = old.get(&id) {
             plan.remove.extend(way_pairs(id, nodes));
@@ -404,7 +413,7 @@ fn write(
     plan: &Plan,
     batch: &Batch,
 ) -> Result<u64, SyncError> {
-    let rev = batch.rev;
+    let (rev, layout) = (batch.rev, batch.tables);
     let mut tx = client.transaction()?;
     let mut log = Rows::default();
     let mut rows = 0;
@@ -417,31 +426,37 @@ fn write(
             Vec::new()
         } else {
             tx.query(
-                &format!("DELETE FROM {table} WHERE id = ANY($1) RETURNING id"),
+                &format!(
+                    "DELETE FROM {} WHERE id = ANY($1) RETURNING id",
+                    table.name(layout)
+                ),
                 &[&w.deleted],
             )?
         };
         for row in &gone {
-            log.row(4).i64(rev).char(kind).i64(row.get(0)).char(b'd');
+            log.row(4).i64(row.get(0)).i32(rev).char(kind).char(b'd');
         }
-        upsert(&mut tx, table, &w.rows)?;
+        upsert(&mut tx, table, layout, &w.rows)?;
         for &id in &w.written {
-            log.row(4).i64(rev).char(kind).i64(id).char(b'u');
+            log.row(4).i64(id).i32(rev).char(kind).char(b'u');
         }
         rows += gone.len() as u64 + w.rows.count;
     }
     if plan.geoms.count > 0 {
         db::copy(&mut tx, "osm_geoms", "id, geom", &plan.geoms)?;
         tx.execute(
-            "UPDATE osm.ways w SET geom = g.geom, minor = w.minor + 1, rev = $1 FROM osm_geoms g WHERE w.id = g.id",
+            &format!(
+                "UPDATE {} w SET geom = g.geom, minor = w.minor + 1, rev = $1 FROM osm_geoms g WHERE w.id = g.id",
+                Table::Ways.name(layout)
+            ),
             &[&rev],
         )?;
         for &id in &plan.moved_ways {
-            log.row(4).i64(rev).char(b'w').i64(id).char(b'g');
+            log.row(4).i64(id).i32(rev).char(b'w').char(b'g');
         }
     }
     if log.count > 0 {
-        db::copy(&mut tx, "osm.changes", "rev, kind, id, action", &log)?;
+        db::copy(&mut tx, "osm.changes", "id, rev, kind, action", &log)?;
     }
     let timestamp = batch.timestamp.map(Timestamp::as_millis);
     let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
@@ -467,15 +482,17 @@ fn write(
 }
 
 /// Creates the session's temporary tables that each batch copies its rows into, emptied at every commit.
-fn create_temp_tables(client: &mut Client) -> Result<(), SyncError> {
+fn create_temp_tables(client: &mut Client, layout: TableLayout) -> Result<(), SyncError> {
     let tables = [Table::Nodes, Table::Ways, Table::Relations].map(|t| {
         format!(
-            "CREATE TEMP TABLE {} (LIKE {t}) ON COMMIT DELETE ROWS;",
-            temp_name(t)
+            "CREATE TEMP TABLE {} (LIKE {}) ON COMMIT DELETE ROWS;",
+            temp_name(t),
+            t.name(layout)
         )
     });
     client.batch_execute(&format!(
-        "CREATE TEMP TABLE osm_geoms ON COMMIT DELETE ROWS AS SELECT id, geom FROM osm.ways WITH NO DATA; {}",
+        "CREATE TEMP TABLE osm_geoms ON COMMIT DELETE ROWS AS SELECT id, geom FROM {} WITH NO DATA; {}",
+        Table::Ways.name(layout),
         tables.concat()
     ))?;
     Ok(())
@@ -488,7 +505,12 @@ fn temp_name(table: Table) -> String {
 
 /// Writes `rows` of `table` over the rows with their IDs, or as new rows: copied into its temporary table, then
 /// merged.
-fn upsert(tx: &mut Transaction<'_>, table: Table, rows: &Rows) -> Result<(), SyncError> {
+fn upsert(
+    tx: &mut Transaction<'_>,
+    table: Table,
+    layout: TableLayout,
+    rows: &Rows,
+) -> Result<(), SyncError> {
     if rows.count == 0 {
         return Ok(());
     }
@@ -497,7 +519,7 @@ fn upsert(tx: &mut Transaction<'_>, table: Table, rows: &Rows) -> Result<(), Syn
     let rest = list.strip_prefix("id, ").unwrap_or(list);
     let new = rest.replace(", ", ", EXCLUDED.");
     db::copy(tx, &tmp, list, rows)?;
-    tx.execute(&format!("INSERT INTO {table} ({list}) SELECT {list} FROM {tmp} ON CONFLICT (id) DO UPDATE SET ({rest}) = ROW(EXCLUDED.{new})"), &[])?;
+    tx.execute(&format!("INSERT INTO {} ({list}) SELECT {list} FROM {tmp} ON CONFLICT (id) DO UPDATE SET ({rest}) = ROW(EXCLUDED.{new})", table.name(layout)), &[])?;
     Ok(())
 }
 

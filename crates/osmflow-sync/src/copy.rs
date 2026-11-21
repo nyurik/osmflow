@@ -1,11 +1,13 @@
 //! Rows in PostgreSQL's binary `COPY` format, encoded straight into a buffer: a row is its field count, then each
 //! field as its length and its bytes, big-endian. Geometries are TWKB with OSM's 7 decimal digits, which PostGIS reads
-//! with `ST_GeomFromTWKB` exactly as they were, or EWKB with SRID 4326, by the database's [`GeometryFormat`].
+//! with `ST_GeomFromTWKB` exactly as they were, or EWKB with SRID 4326, and a way's node IDs are packed or an
+//! `int8[]`, by the database's [`TableLayout`].
 
 use osmflow::{Info, Location, Member, MemberType, Timestamp, osc};
 use twkb::{write_scaled_line_string, write_scaled_point};
 
-use crate::GeometryFormat;
+use crate::TableLayout;
+use crate::varint::pack_ids;
 
 /// The start of a binary `COPY` stream: its signature, no flags, and no header extension.
 pub(crate) const HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0";
@@ -52,20 +54,20 @@ impl From<&osc::Meta> for Meta {
     }
 }
 
-/// Rows of one table, in the binary `COPY` format, without the stream's header and trailer, their geometries in one
-/// format.
+/// Rows of one table, in the binary `COPY` format, without the stream's header and trailer, their geometries and way
+/// node lists in one layout.
 #[derive(Debug, Default)]
 pub(crate) struct Rows {
     pub(crate) buf: Vec<u8>,
     pub(crate) count: u64,
-    geometry: GeometryFormat,
+    tables: TableLayout,
 }
 
 impl Rows {
-    /// No rows yet, their geometries to be in `geometry`.
-    pub(crate) fn new(geometry: GeometryFormat) -> Self {
+    /// No rows yet, to be stored as `tables`.
+    pub(crate) fn new(tables: TableLayout) -> Self {
         Self {
-            geometry,
+            tables,
             ..Self::default()
         }
     }
@@ -75,14 +77,14 @@ impl Rows {
         &mut self,
         id: i64,
         meta: Meta,
-        rev: i64,
+        rev: i32,
         tags: impl Iterator<Item = (&'a str, &'a str)>,
         loc: Option<Location>,
     ) {
         self.row(7)
             .i64(id)
             .meta(meta)
-            .i64(rev)
+            .i32(rev)
             .tags(tags)
             .point(loc);
     }
@@ -92,7 +94,7 @@ impl Rows {
         &mut self,
         id: i64,
         meta: Meta,
-        rev: i64,
+        rev: i32,
         tags: impl Iterator<Item = (&'a str, &'a str)>,
         nodes: impl ExactSizeIterator<Item = i64>,
         line: Option<&[Location]>,
@@ -101,9 +103,9 @@ impl Rows {
             .i64(id)
             .meta(meta)
             .i32(0)
-            .i64(rev)
+            .i32(rev)
             .tags(tags)
-            .ids(nodes)
+            .way_nodes(nodes)
             .line(line);
     }
 
@@ -112,14 +114,14 @@ impl Rows {
         &mut self,
         id: i64,
         meta: Meta,
-        rev: i64,
+        rev: i32,
         tags: impl Iterator<Item = (&'a str, &'a str)>,
         members: impl ExactSizeIterator<Item = Member<'a>> + Clone,
     ) {
         self.row(9)
             .i64(id)
             .meta(meta)
-            .i64(rev)
+            .i32(rev)
             .tags(tags)
             .members(members);
     }
@@ -155,18 +157,18 @@ impl Rows {
         self
     }
 
-    /// The version, changeset and timestamp columns.
+    /// The changeset, timestamp and version columns.
     pub(crate) fn meta(&mut self, meta: Meta) -> &mut Self {
-        match meta.version {
-            Some(v) => self.i32(v),
-            None => self.null(),
-        };
         match meta.changeset {
             Some(c) => self.i64(c),
             None => self.null(),
         };
         match meta.timestamp {
             Some(t) => self.i64((t.as_millis() - PG_EPOCH_MS) * 1000),
+            None => self.null(),
+        };
+        match meta.version {
+            Some(v) => self.i32(v),
             None => self.null(),
         }
     }
@@ -197,6 +199,14 @@ impl Rows {
                 b.extend(id.to_be_bytes());
             }
         })
+    }
+
+    /// A way's node IDs: an `int8[]` when plain, packed in a `bytea` otherwise.
+    fn way_nodes(&mut self, nodes: impl ExactSizeIterator<Item = i64>) -> &mut Self {
+        match self.tables {
+            TableLayout::Plain => self.ids(nodes),
+            TableLayout::Packed => self.var(|b| pack_ids(b, nodes)),
+        }
     }
 
     /// A relation's members, as three columns: `"char"[]` types, `int8[]` IDs, `text[]` roles.
@@ -231,12 +241,12 @@ impl Rows {
         let Some(loc) = loc else {
             return self.null();
         };
-        let format = self.geometry;
-        self.var(|b| match format {
-            GeometryFormat::Twkb => {
+        let layout = self.tables;
+        self.var(|b| match layout {
+            TableLayout::Packed => {
                 write_scaled_point(b, DIGITS, xy(loc)).expect("7 digits are in range");
             }
-            GeometryFormat::Wkb => {
+            TableLayout::Plain => {
                 ewkb_header(b, 1);
                 push_location(b, loc);
             }
@@ -248,13 +258,13 @@ impl Rows {
         let Some(locs) = locs.filter(|l| l.len() >= 2) else {
             return self.null();
         };
-        let format = self.geometry;
-        self.var(|b| match format {
-            GeometryFormat::Twkb => {
+        let layout = self.tables;
+        self.var(|b| match layout {
+            TableLayout::Packed => {
                 write_scaled_line_string(b, DIGITS, locs.iter().map(|&l| xy(l)))
                     .expect("7 digits are in range");
             }
-            GeometryFormat::Wkb => {
+            TableLayout::Plain => {
                 ewkb_header(b, 2);
                 b.extend(len(locs.len()).to_le_bytes());
                 for &loc in locs {
@@ -474,7 +484,7 @@ mod tests {
     fn lines_are_ewkb() {
         // Byte order, line string with an SRID, 4326, 2 points, then each point's x and y
         let locs = [Location::new(10, -20), Location::new(-30, 40)];
-        let mut rows = Rows::new(GeometryFormat::Wkb);
+        let mut rows = Rows::new(TableLayout::Plain);
         rows.line(Some(&locs));
         let mut ewkb = vec![1, 2, 0, 0, 0x20, 0xe6, 0x10, 0, 0, 2, 0, 0, 0];
         for loc in locs {

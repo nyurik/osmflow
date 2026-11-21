@@ -12,6 +12,7 @@ mod sort;
 mod stop;
 mod tls;
 mod update;
+mod varint;
 
 use std::path::{Path, PathBuf};
 use std::{fmt, thread};
@@ -21,7 +22,7 @@ use osmflow::nodes::prelude::*;
 use osmflow::osc::Replication;
 use postgres::Client;
 
-pub use crate::db::{DbState, GeometryFormat};
+pub use crate::db::{DbState, TableLayout};
 pub use crate::error::SyncError;
 pub use crate::follow::{FollowError, FollowOpts};
 pub use crate::import::{ImportOpts, ImportStats};

@@ -11,7 +11,7 @@ use osmflow::nodes::prelude::*;
 use osmflow::osc::{Replication, State};
 use tracing::info;
 
-use crate::db::DbState;
+use crate::db::{DbState, Table};
 use crate::index::Pair;
 use crate::update::Changes;
 use crate::{OpenMirror, SyncError};
@@ -104,13 +104,16 @@ impl OpenMirror {
             return Ok(());
         }
         let rows = self.client.query(
-            "SELECT id, nodes FROM osm.ways WHERE id IN \
-             (SELECT id FROM osm.changes WHERE kind = 'w' AND action = 'u' AND rev > $1)",
+            &format!(
+                "SELECT id, nodes FROM {} WHERE id IN \
+                 (SELECT id FROM osm.changes WHERE kind = 'w' AND action = 'u' AND rev > $1::int8)",
+                Table::Ways.name(state.tables)
+            ),
             &[&rev],
         )?;
         let mut add: Vec<Pair> = Vec::new();
         for row in rows {
-            add.extend(way_pairs(row.get(0), &row.get::<_, Vec<i64>>(1)));
+            add.extend(way_pairs(row.get(0), &state.tables.node_ids(&row, 1)));
         }
         add.sort_unstable();
         add.dedup();
@@ -143,7 +146,7 @@ impl OpenMirror {
             return Ok(store);
         }
         let batches = self.client.query(
-            "SELECT rev, first_sequence, last_sequence FROM osm.batches WHERE rev > $1 ORDER BY rev",
+            "SELECT rev::int8, first_sequence, last_sequence FROM osm.batches WHERE rev > $1::int8 ORDER BY rev",
             &[&rev],
         )?;
         for b in batches {

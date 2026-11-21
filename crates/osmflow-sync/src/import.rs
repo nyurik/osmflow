@@ -18,10 +18,10 @@ use crate::db::{self, DbState, SCHEMA_VERSION, Table, Writers};
 use crate::files::{ID_KEY, remove_node_file};
 use crate::index::{self, ReverseIndex};
 use crate::sort::Sorter;
-use crate::{GeometryFormat, Mirror, SyncError};
+use crate::{Mirror, SyncError, TableLayout};
 
 /// The revision of the imported data.
-pub(crate) const IMPORT_REV: i64 = 1;
+pub(crate) const IMPORT_REV: i32 = 1;
 
 /// How to import.
 #[derive(Debug, Clone)]
@@ -36,8 +36,8 @@ pub struct ImportOpts {
     pub sequence: Option<u64>,
     /// The database connections rows are copied on, at once.
     pub connections: usize,
-    /// How `osm.nodes` and `osm.ways` store their geometries, from then on: TWKB by default.
-    pub geometry: GeometryFormat,
+    /// The layout of `osm.nodes` and `osm.ways`, from then on; packed by default: see [`TableLayout`].
+    pub tables: TableLayout,
 }
 
 impl Default for ImportOpts {
@@ -47,7 +47,7 @@ impl Default for ImportOpts {
             replication_url: None,
             sequence: None,
             connections: crate::default_connections(),
-            geometry: GeometryFormat::default(),
+            tables: TableLayout::default(),
         }
     }
 }
@@ -93,7 +93,7 @@ pub(crate) fn import(
         .or_else(|| header.replication_base_url.clone());
 
     let mut client = db::connect(&m.url)?;
-    create_schema(&mut client, opts.replace, opts.geometry)?;
+    create_schema(&mut client, opts.replace, opts.tables)?;
     fs::create_dir_all(&m.dir)?;
     remove_node_file(&m.node_path())?;
     index::remove(&m.index_path())?;
@@ -118,7 +118,7 @@ pub(crate) fn import(
         &store,
         &m.url,
         opts.connections,
-        opts.geometry,
+        opts.tables,
         &mut stats,
         &m.dir,
     )?;
@@ -134,13 +134,13 @@ pub(crate) fn import(
     // their own
     let t = Instant::now();
     let (index, tables) = thread::scope(|s| {
-        let tables = s.spawn(|| finish_tables(&m.url));
+        let tables = s.spawn(|| finish_tables(&m.url, opts.tables));
         let t = Instant::now();
         let index = pairs.finish().map_err(SyncError::from).and_then(|sorted| {
             ReverseIndex::create(
                 &m.index_path(),
                 id,
-                IMPORT_REV,
+                IMPORT_REV.into(),
                 sorted.map(|p| p.map_err(SyncError::from)),
             )
         });
@@ -155,7 +155,7 @@ pub(crate) fn import(
     stats.pairs = index?.1;
     tables?;
     store.set_metadata(ID_KEY, &id.to_le_bytes())?;
-    store.commit(IMPORT_REV.cast_unsigned())?;
+    store.commit(u64::from(IMPORT_REV.cast_unsigned()))?;
     info!(
         pairs = stats.pairs,
         secs = t.elapsed().as_secs_f32(),
@@ -164,11 +164,11 @@ pub(crate) fn import(
 
     let position = DbState {
         id,
-        rev: IMPORT_REV,
+        rev: IMPORT_REV.into(),
         url,
         sequence,
         timestamp,
-        geometry: opts.geometry,
+        tables: opts.tables,
     };
     record(&mut client, &position, &stats)?;
     Ok(stats)
@@ -182,7 +182,7 @@ fn record(client: &mut Client, at: &DbState, loaded: &ImportStats) -> Result<(),
         "INSERT INTO osm.batches (rev, first_sequence, last_sequence, timestamp, nodes, ways, relations) \
          VALUES ($1, $2, $2, to_timestamp($3::int8 / 1000.0), $4, $5, $6)",
         &[
-            &at.rev,
+            &IMPORT_REV,
             &at.sequence,
             &timestamp,
             &loaded.tagged_nodes.cast_signed(),
@@ -191,16 +191,16 @@ fn record(client: &mut Client, at: &DbState, loaded: &ImportStats) -> Result<(),
         ],
     )?;
     tx.execute(
-        "INSERT INTO osm.state (id, version, rev, url, sequence, timestamp, geometry) \
+        "INSERT INTO osm.state (id, version, rev, url, sequence, timestamp, tables) \
          VALUES ($1, $2, $3, $4, $5, to_timestamp($6::int8 / 1000.0), $7)",
         &[
             &at.id,
             &SCHEMA_VERSION,
-            &at.rev,
+            &IMPORT_REV,
             &at.url,
             &at.sequence,
             &timestamp,
-            &at.geometry.as_ref(),
+            &at.tables.as_ref(),
         ],
     )?;
     tx.commit()?;
@@ -303,13 +303,9 @@ fn start(
     }
 }
 
-/// Creates the `osm` schema, with its geometry columns and `osm.geom` for `format`, after dropping an existing one
-/// if `replace`.
-fn create_schema(
-    client: &mut Client,
-    replace: bool,
-    format: GeometryFormat,
-) -> Result<(), SyncError> {
+/// Creates the `osm` schema, with `layout`'s column types and, when packed, the functions and views, after dropping
+/// an existing one if `replace`.
+fn create_schema(client: &mut Client, replace: bool, layout: TableLayout) -> Result<(), SyncError> {
     if replace {
         client.batch_execute("DROP SCHEMA IF EXISTS osm CASCADE")?;
     } else if client
@@ -329,11 +325,14 @@ fn create_schema(
             &[],
         )?
         .get(0);
-    let (point, line, geom) = format.sql(&postgis);
+    let sql = layout.sql(&postgis);
     let schema = include_str!("schema.sql")
-        .replace("{point}", point)
-        .replace("{line}", line)
-        .replace("{geom_function}", &geom);
+        .replace("{nodes}", Table::Nodes.name(layout))
+        .replace("{ways}", Table::Ways.name(layout))
+        .replace("{point}", sql.point)
+        .replace("{line}", sql.line)
+        .replace("{ids}", sql.ids)
+        .replace("{views}", &sql.after);
     client.batch_execute(&schema)?;
     Ok(())
 }
@@ -345,15 +344,15 @@ fn copy_objects(
     store: &PagedStore,
     url: &str,
     connections: usize,
-    format: GeometryFormat,
+    layout: TableLayout,
     stats: &mut ImportStats,
     dir: &Path,
 ) -> Result<Sorter, SyncError> {
-    let writers = Writers::start(url, connections)?;
+    let writers = Writers::start(url, connections, layout)?;
     let pairs = Sorter::new(dir)?;
     let counts = [const { AtomicU64::new(0) }; 3];
     let read = reader.par_resolve(Select::all(), store, |block, locator| {
-        let mut rows = [Rows::new(format), Rows::new(format), Rows::default()];
+        let mut rows = [Rows::new(layout), Rows::new(layout), Rows::default()];
         for n in block.nodes().filter(|n| n.tags().len() > 0) {
             let loc = Location::new(n.decimicro_lat(), n.decimicro_lon());
             rows[0].node(n.id(), n.info().into(), IMPORT_REV, n.tags(), Some(loc));
@@ -409,9 +408,10 @@ fn copy_objects(
 
 /// Adds the primary keys and analyzes, each table on a connection of its own. Autovacuum, off during the load,
 /// vacuums them later.
-fn finish_tables(url: &str) -> Result<(), SyncError> {
+fn finish_tables(url: &str, layout: TableLayout) -> Result<(), SyncError> {
     thread::scope(|s| {
         let tables = [Table::Nodes, Table::Ways, Table::Relations].map(|t| {
+            let t = t.name(layout);
             s.spawn(move || -> Result<(), SyncError> {
                 let mut client = db::connect(url)?;
                 for sql in [
