@@ -64,7 +64,7 @@ fn import_and_update() -> Result<(), Box<dyn std::error::Error>> {
   ways' node lists 6.0 MB against 25.9 MB as `int8[]` (New York City: 17.6 MB against 86.7 MB), imported with
   `osmflow sync import` and summed with `pg_column_size`, on PostgreSQL 18 in Docker on a laptop. `osm.node_ids` decodes
   about 1.3 µs per node (all ways of New York City: 9.1 s
-  against 0.28 s reading `int8[]`), so bulk readers should read `osm.ways_packed` and decode the bytes themselves.
+  against 0.28 s reading `int8[]`), so bulk readers should read `osm.ways_packed` and decode the bytes with [`NodeIds`].
   Postgres inlines `osm.geom`, so `CREATE INDEX ON osm.ways_packed USING gist (osm.geom(geom))` serves queries on the
   view. Plain, `osm.nodes` and `osm.ways` are the tables, with PostGIS's `geometry`, which needs no decoding and an
   `int8[]`, and the index is `osm.ways USING gist (geom)`.

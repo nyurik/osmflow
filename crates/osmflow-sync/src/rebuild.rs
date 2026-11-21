@@ -17,7 +17,7 @@ use tracing::info;
 use wkb::reader::read_wkb;
 
 use crate::copy::{locations, osm_twkb};
-use crate::db::{self, DbState, Table};
+use crate::db::{self, DbState, NodeIds, Table};
 use crate::files::{ID_KEY, read_diffs, remove_node_file, set_locations, way_pairs};
 use crate::index::ReverseIndex;
 use crate::sort::{Sorted, Sorter};
@@ -171,7 +171,7 @@ fn db_locations(client: &mut Client, dir: &Path, layout: TableLayout) -> Result<
         let mut rows = client.query_raw(&sql, iter::empty::<&str>())?;
         while let Some(row) = rows.next()? {
             let nodes = if is_way {
-                layout.node_ids(&row, 2)
+                row.get::<_, NodeIds>(2).0
             } else {
                 vec![row.get(2)]
             };
@@ -228,7 +228,7 @@ fn db_pairs(client: &mut Client, dir: &Path, tables: TableLayout) -> Result<Sort
     let sql = format!("SELECT id, nodes FROM {}", Table::Ways.name(tables));
     let mut rows = client.query_raw(&sql, iter::empty::<&str>())?;
     while let Some(row) = rows.next()? {
-        sorter.extend(way_pairs(row.get(0), &tables.node_ids(&row, 1)))?;
+        sorter.extend(way_pairs(row.get(0), &row.get::<_, NodeIds>(1).0))?;
     }
     Ok(sorter.finish()?)
 }
