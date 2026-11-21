@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/nyurik/osmflow/compare/osmflow-cli-v0.14.1...osmflow-cli-v0.15.0) - 2026-11-21
+
+### Added
+
+- *(sync)* connect with TLS as the connection string's sslmode asks ([#69](https://github.com/nyurik/osmflow/pull/69))
+- *(sync)* [**breaking**] stop an update on a time limit or Ctrl+C, and follow the stream ([#67](https://github.com/nyurik/osmflow/pull/67))
+
 ## [0.14.1](https://github.com/nyurik/osmflow/compare/osmflow-cli-v0.14.0...osmflow-cli-v0.14.1) - 2026-11-12
 
 ### Added
