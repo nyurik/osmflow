@@ -14,7 +14,7 @@ use crate::copy::Rows;
 use crate::db::{self, DbState, Table};
 use crate::files::{read_diffs, set_locations, way_pairs};
 use crate::index::{Pair, ReverseIndex};
-use crate::{OpenMirror, Stop, StopReason, Storage, SyncError};
+use crate::{OpenMirror, Stop, StopReason, SyncError, TableLayout};
 
 /// How to update.
 #[derive(Debug, Clone)]
@@ -121,7 +121,7 @@ impl OpenMirror {
         // database did not commit, so the file is opened again on the next update
         let mut store = self.take_node_file(&state, replication)?;
         if !self.temp_tables {
-            create_temp_tables(&mut self.client, state.storage)?;
+            create_temp_tables(&mut self.client, state.tables)?;
             self.temp_tables = true;
         }
         let total = apply_diffs(
@@ -170,7 +170,7 @@ fn apply_diffs(
             first: next.cast_signed(),
             last: last.cast_signed(),
             timestamp: last_state.map(|s| s.timestamp),
-            storage: state.storage,
+            tables: state.tables,
         };
         let applied = apply(client, store, index, &changes, &batch)?;
         info!(
@@ -240,7 +240,7 @@ struct Batch {
     first: i64,
     last: i64,
     timestamp: Option<Timestamp>,
-    storage: Storage,
+    tables: TableLayout,
 }
 
 /// Rows to write into a table, and IDs to delete from it.
@@ -284,18 +284,18 @@ fn apply(
         .collect();
     ids.sort_unstable();
     ids.dedup();
-    let storage = batch.storage;
+    let tables = batch.tables;
     // From the stored table, decoded here: `osm.node_ids` is far slower
     let old: HashMap<i64, Vec<i64>> = client
         .query(
             &format!(
                 "SELECT id, nodes FROM {} WHERE id = ANY($1)",
-                Table::Ways.name(storage)
+                Table::Ways.name(tables)
             ),
             &[&ids],
         )?
         .iter()
-        .map(|r| (r.get(0), storage.node_ids(r, 1)))
+        .map(|r| (r.get(0), tables.node_ids(r, 1)))
         .collect();
     let read = t.elapsed();
     let plan = plan(store, changes, &through, &old, batch);
@@ -329,11 +329,11 @@ fn plan(
     old: &HashMap<i64, Vec<i64>>,
     batch: &Batch,
 ) -> Plan {
-    let (rev, format) = (batch.rev, batch.storage);
+    let (rev, layout) = (batch.rev, batch.tables);
     let mut plan = Plan::default();
-    plan.nodes.rows = Rows::new(format);
-    plan.ways.rows = Rows::new(format);
-    plan.geoms = Rows::new(format);
+    plan.nodes.rows = Rows::new(layout);
+    plan.ways.rows = Rows::new(layout);
+    plan.geoms = Rows::new(layout);
     for (&id, (deleted, w)) in &changes.ways {
         if let Some(nodes) = old.get(&id) {
             plan.remove.extend(way_pairs(id, nodes));
@@ -413,7 +413,7 @@ fn write(
     plan: &Plan,
     batch: &Batch,
 ) -> Result<u64, SyncError> {
-    let (rev, format) = (batch.rev, batch.storage);
+    let (rev, layout) = (batch.rev, batch.tables);
     let mut tx = client.transaction()?;
     let mut log = Rows::default();
     let mut rows = 0;
@@ -428,7 +428,7 @@ fn write(
             tx.query(
                 &format!(
                     "DELETE FROM {} WHERE id = ANY($1) RETURNING id",
-                    table.name(format)
+                    table.name(layout)
                 ),
                 &[&w.deleted],
             )?
@@ -436,7 +436,7 @@ fn write(
         for row in &gone {
             log.row(4).i64(row.get(0)).i32(rev).char(kind).char(b'd');
         }
-        upsert(&mut tx, table, format, &w.rows)?;
+        upsert(&mut tx, table, layout, &w.rows)?;
         for &id in &w.written {
             log.row(4).i64(id).i32(rev).char(kind).char(b'u');
         }
@@ -447,7 +447,7 @@ fn write(
         tx.execute(
             &format!(
                 "UPDATE {} w SET geom = g.geom, minor = w.minor + 1, rev = $1 FROM osm_geoms g WHERE w.id = g.id",
-                Table::Ways.name(format)
+                Table::Ways.name(layout)
             ),
             &[&rev],
         )?;
@@ -482,17 +482,17 @@ fn write(
 }
 
 /// Creates the session's temporary tables that each batch copies its rows into, emptied at every commit.
-fn create_temp_tables(client: &mut Client, format: Storage) -> Result<(), SyncError> {
+fn create_temp_tables(client: &mut Client, layout: TableLayout) -> Result<(), SyncError> {
     let tables = [Table::Nodes, Table::Ways, Table::Relations].map(|t| {
         format!(
             "CREATE TEMP TABLE {} (LIKE {}) ON COMMIT DELETE ROWS;",
             temp_name(t),
-            t.name(format)
+            t.name(layout)
         )
     });
     client.batch_execute(&format!(
         "CREATE TEMP TABLE osm_geoms ON COMMIT DELETE ROWS AS SELECT id, geom FROM {} WITH NO DATA; {}",
-        Table::Ways.name(format),
+        Table::Ways.name(layout),
         tables.concat()
     ))?;
     Ok(())
@@ -508,7 +508,7 @@ fn temp_name(table: Table) -> String {
 fn upsert(
     tx: &mut Transaction<'_>,
     table: Table,
-    format: Storage,
+    layout: TableLayout,
     rows: &Rows,
 ) -> Result<(), SyncError> {
     if rows.count == 0 {
@@ -519,7 +519,7 @@ fn upsert(
     let rest = list.strip_prefix("id, ").unwrap_or(list);
     let new = rest.replace(", ", ", EXCLUDED.");
     db::copy(tx, &tmp, list, rows)?;
-    tx.execute(&format!("INSERT INTO {} ({list}) SELECT {list} FROM {tmp} ON CONFLICT (id) DO UPDATE SET ({rest}) = ROW(EXCLUDED.{new})", table.name(format)), &[])?;
+    tx.execute(&format!("INSERT INTO {} ({list}) SELECT {list} FROM {tmp} ON CONFLICT (id) DO UPDATE SET ({rest}) = ROW(EXCLUDED.{new})", table.name(layout)), &[])?;
     Ok(())
 }
 

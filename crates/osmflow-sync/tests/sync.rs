@@ -14,7 +14,7 @@ use osmflow::nodes::prelude::*;
 use osmflow::osc::Replication;
 use osmflow_sync::{
     FileStamp, FollowError, FollowOpts, ImportOpts, Mirror, NodeWay, Rebuild, Stop, StopReason,
-    Storage, UpdateOpts,
+    TableLayout, UpdateOpts,
 };
 use postgres::{Client, NoTls};
 
@@ -65,23 +65,23 @@ fn import_update_rebuild() {
         return;
     };
     let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
-    // The same imports, updates and rebuilds with each storage: one after the other, in one schema
-    for storage in [Storage::Packed, Storage::Plain] {
-        import_update_rebuild_as(&url, storage);
+    // The same imports, updates and rebuilds with each layout: one after the other, in one schema
+    for tables in [TableLayout::Packed, TableLayout::Plain] {
+        import_update_rebuild_as(&url, tables);
     }
 }
 
-fn import_update_rebuild_as(url: &str, storage: Storage) {
+fn import_update_rebuild_as(url: &str, tables: TableLayout) {
     let dir = tempfile::tempdir().unwrap();
     let diffs = dir.path().join("diffs");
     write_state(&diffs, 708, STATE);
     let replication = Replication::local(&diffs);
     let files = dir.path().join("files");
     let mirror = Mirror::new(url, &files);
-    import(&mirror, storage);
+    import(&mirror, tables);
     let mut db = Client::connect(url, NoTls).unwrap();
-    assert_eq!(mirror.state().unwrap().storage, storage);
-    check_geometry(&mut db, storage);
+    assert_eq!(mirror.state().unwrap().tables, tables);
+    check_geometry(&mut db, tables);
     check_metadata(&mut db);
     write_diffs(&diffs, &mut db);
 
@@ -139,10 +139,10 @@ fn import_update_rebuild_as(url: &str, storage: Storage) {
     );
     check_files(&mirror, 5);
 
-    update_failures(storage, &mirror, &replication, &mut db, &saved, &one_by_one);
+    update_failures(tables, &mirror, &replication, &mut db, &saved, &one_by_one);
 
     // The same diffs in one batch: the same rows, each way changed once
-    import(&mirror, storage);
+    import(&mirror, tables);
     let stats = mirror.update(&replication, &until(1711, 60)).unwrap();
     assert_eq!((stats.batches, stats.diffs), (1, 3));
     assert_eq!(rows(&mut db), one_by_one);
@@ -194,7 +194,7 @@ fn fixture(url: &str) -> Fixture {
     let diffs = dir.path().join("diffs");
     write_state(&diffs, 708, STATE);
     let mirror = Mirror::new(url, dir.path().join("files"));
-    import(&mirror, Storage::Packed);
+    import(&mirror, TableLayout::Packed);
     let mut db = Client::connect(url, NoTls).unwrap();
     write_diffs(&diffs, &mut db);
     // The stream's latest state, which follow reads to know what is new: diff 1712's
@@ -404,7 +404,7 @@ fn an_error_after_a_batch_ends_the_follow_with_the_batch_committed() {
 }
 
 /// The node file rebuilt from the database has the locations the update gave the nodes of a way with a repeated
-/// point, in either format.
+/// point, in either layout.
 #[test]
 fn rebuild_keeps_repeated_points() {
     let Ok(url) = env::var("OSMFLOW_SYNC_TEST_DB") else {
@@ -412,30 +412,30 @@ fn rebuild_keeps_repeated_points() {
     };
     let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
     // Plain first, so the packed import replaces a plain schema, where the other test replaces a packed one
-    for storage in [Storage::Plain, Storage::Packed] {
+    for tables in [TableLayout::Plain, TableLayout::Packed] {
         let dir = tempfile::tempdir().unwrap();
         let diffs = dir.path().join("diffs");
         write_state(&diffs, 708, STATE);
         write_diff(&diffs, 709, DIFF_REPEATED);
         let mirror = Mirror::new(&url, dir.path().join("files"));
-        import(&mirror, storage);
+        import(&mirror, tables);
         mirror
             .update(&Replication::local(&diffs), &until(1709, 1))
             .unwrap();
         let mut db = Client::connect(&url, NoTls).unwrap();
         let located = db_node_locations(&mirror, &mut db);
         let at = |id| located.iter().find(|(n, _)| *n == id).map(|(_, l)| *l);
-        assert_eq!(at(13_000_000_001), at(13_000_000_002), "{storage:?}");
+        assert_eq!(at(13_000_000_001), at(13_000_000_002), "{tables:?}");
         fs::remove_file(mirror.index_path()).unwrap();
         mirror.rebuild(&Rebuild::Database).unwrap();
         assert_same_locations(&mirror, &mut db, &located);
         // A way whose geometry has fewer points than it has nodes fails the rebuild
-        let (ways, two) = match storage {
-            Storage::Packed => (
+        let (ways, two) = match tables {
+            TableLayout::Packed => (
                 "osm.ways_packed",
                 "ST_AsTWKB('LINESTRING(0 0,1 1)'::geometry, 7)",
             ),
-            Storage::Plain => ("osm.ways", "'SRID=4326;LINESTRING(0 0,1 1)'::geometry"),
+            TableLayout::Plain => ("osm.ways", "'SRID=4326;LINESTRING(0 0,1 1)'::geometry"),
         };
         db.batch_execute(&format!(
             "UPDATE {ways} SET geom = {two} WHERE id = 2000000001"
@@ -481,7 +481,7 @@ fn db_node_locations(mirror: &Mirror, db: &mut Client) -> Vec<(i64, Option<Locat
 /// files, and a node file of another database (from the files in `saved`). `one_by_one` holds the rows after diffs
 /// 1709 to 1711 applied one per batch.
 fn update_failures(
-    storage: Storage,
+    tables: TableLayout,
     mirror: &Mirror,
     replication: &Replication,
     db: &mut Client,
@@ -490,7 +490,7 @@ fn update_failures(
 ) {
     // The third batch of an update fails after its moved node reached the node file, the first two committed: the
     // retry on the same mirror applies the third, moving the way through the node, and gives the same rows
-    import(mirror, storage);
+    import(mirror, tables);
     let mut open = mirror.open().unwrap();
     db.batch_execute(
         "CREATE FUNCTION osm.fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE 'injected'; END $$; \
@@ -535,8 +535,8 @@ fn update_failures(
     );
 }
 
-/// The tables and views `storage` makes of `osm.ways`, and an index serving a bbox query on it.
-fn check_geometry(db: &mut Client, storage: Storage) {
+/// The tables and views the layout `tables` makes of `osm.ways`, and an index serving a bbox query on it.
+fn check_geometry(db: &mut Client, tables: TableLayout) {
     let info = |db: &mut Client, table: &str, column: &str| -> Option<(String, String)> {
         let row = db
             .query_opt(
@@ -548,8 +548,8 @@ fn check_geometry(db: &mut Client, storage: Storage) {
         Some((row.get(0), row.get(1)))
     };
     let of = |kind: &str, ty: &str| Some((kind.to_owned(), ty.to_owned()));
-    let index = match storage {
-        Storage::Packed => {
+    let index = match tables {
+        TableLayout::Packed => {
             // The stored tables have the bytes, and the views decode them
             for (table, column) in [
                 ("osm.ways_packed", "geom"),
@@ -572,7 +572,7 @@ fn check_geometry(db: &mut Client, storage: Storage) {
             assert_eq!(ids, [0, i64::MAX, 1]);
             "osm.ways_packed USING gist (osm.geom(geom))"
         }
-        Storage::Plain => {
+        TableLayout::Plain => {
             assert_eq!(
                 info(db, "osm.ways", "geom"),
                 of("r", "geometry(LineString,4326)")
@@ -649,10 +649,10 @@ const WAY_NODES: [i64; 39] = [
     2_205_706_485,
 ];
 
-fn import(mirror: &Mirror, storage: Storage) {
+fn import(mirror: &Mirror, tables: TableLayout) {
     let opts = ImportOpts {
         replace: true,
-        storage,
+        tables,
         ..ImportOpts::default()
     };
     let stats = mirror.import(PBF, None, &opts).unwrap();

@@ -14,8 +14,8 @@ CREATE TABLE osm.state (
     url       text,
     sequence  int8        NOT NULL,
     timestamp timestamptz,
-    -- How `osm.nodes` and `osm.ways` store their rows: 'packed' or 'plain'
-    storage   text        NOT NULL
+    -- The layout of `osm.nodes` and `osm.ways`: 'packed' or 'plain'
+    tables    text        NOT NULL
 );
 
 -- One row per revision: the import, then each update batch.

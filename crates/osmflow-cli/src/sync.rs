@@ -11,8 +11,8 @@ use anyhow::{Context as _, Result};
 use osmflow::PbfReader;
 use osmflow::osc::Replication;
 use osmflow_sync::{
-    DbState, FileStamp, FollowOpts, ImportOpts, Mirror, Rebuild, Signal, Stop, StopReason, Storage,
-    SyncError, UpdateOpts,
+    DbState, FileStamp, FollowOpts, ImportOpts, Mirror, Rebuild, Signal, Stop, StopReason,
+    SyncError, TableLayout, UpdateOpts,
 };
 
 use crate::input::fetch;
@@ -76,7 +76,7 @@ enum Command {
         /// Database connections to copy on at once; half the cores, up to 8, by default.
         #[arg(long, value_name = "N")]
         connections: Option<usize>,
-        /// How `osm.nodes` and `osm.ways` store their rows, from then on.
+        /// The layout of `osm.nodes` and `osm.ways`, from then on.
         ///
         /// Either way, SQL reads them with `geom` as a geometry and a way's `nodes` as an `int8[]`. `packed` makes
         /// the tables `osm.nodes_packed` and `osm.ways_packed`, with TWKB geometries and node lists as varints, and
@@ -85,8 +85,8 @@ enum Command {
         /// readers should read `osm.ways_packed` and decode the node bytes themselves, as `osm.node_ids` takes about
         /// 1.3 µs per node. `plain` stores PostGIS geometries and `int8[]` in `osm.nodes` and `osm.ways`, read without
         /// decoding.
-        #[arg(long, default_value_t, value_parser = names::<Storage>())]
-        storage: Storage,
+        #[arg(long, default_value_t, value_parser = names::<TableLayout>())]
+        tables: TableLayout,
     },
     /// Applies the replication diffs after the database's sequence, up to the latest.
     ///
@@ -148,13 +148,13 @@ pub fn run(args: &Args) -> Result<ExitCode> {
             sequence,
             cache,
             connections,
-            storage,
+            tables,
         } => {
             let mut opts = ImportOpts {
                 replace: *replace,
                 replication_url: replication.clone(),
                 sequence: *sequence,
-                storage: *storage,
+                tables: *tables,
                 ..ImportOpts::default()
             };
             if let Some(n) = connections {
@@ -477,26 +477,19 @@ mod tests {
             );
             s.db.sequence
         };
-        for storage in ["packed", "plain"] {
+        for tables in ["packed", "plain"] {
             sync(
                 &[
                     &["import"],
                     &place[..],
-                    &[
-                        PBF,
-                        "--replace",
-                        "--replication",
-                        diffs,
-                        "--storage",
-                        storage,
-                    ],
+                    &[PBF, "--replace", "--replication", diffs, "--tables", tables],
                 ]
                 .concat(),
             );
-            assert_eq!(at(1), 1708, "{storage}");
-            assert_eq!(mirror.state().unwrap().storage.to_string(), storage);
+            assert_eq!(at(1), 1708, "{tables}");
+            assert_eq!(mirror.state().unwrap().tables.to_string(), tables);
             sync(&[&["update"], &place[..]].concat());
-            assert_eq!(at(2), 1709, "{storage}");
+            assert_eq!(at(2), 1709, "{tables}");
             let way = NodeWay {
                 node: NODE,
                 way: 178_300_745,
@@ -507,7 +500,7 @@ mod tests {
             for from in [&[][..], &["--pbf", PBF][..]] {
                 fs::remove_file(mirror.index_path()).unwrap();
                 sync(&[&["rebuild"], &place[..], from].concat());
-                assert_eq!(at(2), 1709, "{storage} {from:?}");
+                assert_eq!(at(2), 1709, "{tables} {from:?}");
             }
         }
     }

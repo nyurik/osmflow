@@ -55,7 +55,7 @@ fn import_and_update() -> Result<(), Box<dyn std::error::Error>> {
 * **`rev`, `minor` and `osm.changes` depend on the batches:** a way whose nodes move in two diffs has `minor` 2 if the
   diffs were applied in two batches, and 1 if in one, and the log lists each object once per batch. Two databases
   kept from one stream have the same rows otherwise.
-* **Rows are stored packed or plain,** as [`ImportOpts::storage`] says, for good. Either way, SQL reads `osm.nodes` and
+* **Rows are stored packed or plain,** as [`ImportOpts::tables`] says, for good. Either way, SQL reads `osm.nodes` and
   `osm.ways` with `geom` as a PostGIS geometry and `nodes` as an `int8[]`. Packed, the default, makes the tables
   `osm.nodes_packed` and `osm.ways_packed`, and `osm.nodes` and `osm.ways` are views that decode them with `osm.geom`
   and `osm.node_ids`. `geom` is TWKB with OSM's 7 decimal digits in a `bytea`, which PostGIS reads back exactly as the

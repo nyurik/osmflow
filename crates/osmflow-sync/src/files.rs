@@ -107,13 +107,13 @@ impl OpenMirror {
             &format!(
                 "SELECT id, nodes FROM {} WHERE id IN \
                  (SELECT id FROM osm.changes WHERE kind = 'w' AND action = 'u' AND rev > $1::int8)",
-                Table::Ways.name(state.storage)
+                Table::Ways.name(state.tables)
             ),
             &[&rev],
         )?;
         let mut add: Vec<Pair> = Vec::new();
         for row in rows {
-            add.extend(way_pairs(row.get(0), &state.storage.node_ids(&row, 1)));
+            add.extend(way_pairs(row.get(0), &state.tables.node_ids(&row, 1)));
         }
         add.sort_unstable();
         add.dedup();

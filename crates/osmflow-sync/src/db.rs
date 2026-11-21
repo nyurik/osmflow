@@ -28,14 +28,14 @@ pub struct DbState {
     pub sequence: i64,
     /// The time of that sequence's state.
     pub timestamp: Option<Timestamp>,
-    /// How `osm.nodes` and `osm.ways` store their geometries.
-    pub storage: Storage,
+    /// The layout of `osm.nodes` and `osm.ways`.
+    pub tables: TableLayout,
 }
 
 /// How `osm.nodes` and `osm.ways` store their rows: chosen by the import, kept by every update.
 ///
 /// SQL reads `osm.nodes` and `osm.ways` with `geom` as a PostGIS geometry and `nodes` as an `int8[]` in either
-/// storage. When packed, the tables are `osm.nodes_packed` and `osm.ways_packed`, and `osm.nodes` and `osm.ways` are
+/// layout. When packed, the tables are `osm.nodes_packed` and `osm.ways_packed`, and `osm.nodes` and `osm.ways` are
 /// views over them that decode `geom` with `osm.geom(geom)` and `nodes` with `osm.node_ids(nodes)`. `osm.geom` is
 /// inlined, so an index on `osm.ways_packed (osm.geom(geom))` serves queries on the view `osm.ways`; when plain, the
 /// index is on `osm.ways (geom)`.
@@ -55,7 +55,7 @@ pub struct DbState {
     strum::VariantNames,
 )]
 #[strum(serialize_all = "lowercase")]
-pub enum Storage {
+pub enum TableLayout {
     /// Compact tables, read through the views `osm.nodes` and `osm.ways`. `geom` is TWKB with OSM's 7 decimal digits
     /// in a `bytea`, which PostGIS reads exactly as the locations were written: 11.5 MB against 48.3 MB of WKB in the
     /// District of Columbia. A way's `nodes` is a `bytea` of its node IDs, each as the step from the
@@ -70,8 +70,8 @@ pub enum Storage {
     Plain,
 }
 
-/// The SQL of a [`Storage`], for `schema.sql`.
-pub(crate) struct StorageSql {
+/// The SQL of a [`TableLayout`], for `schema.sql`.
+pub(crate) struct LayoutSql {
     /// The column type of a point.
     pub(crate) point: &'static str,
     /// The column type of a line string.
@@ -83,12 +83,12 @@ pub(crate) struct StorageSql {
     pub(crate) after: String,
 }
 
-impl Storage {
+impl TableLayout {
     /// The column types, and the functions and views, with PostGIS in schema `postgis`.
     ///
     /// The body of `osm.geom` names PostGIS's schema: Postgres reads it again where it inlines it, and builds indexes
     /// with only `pg_catalog` in the search path.
-    pub(crate) fn sql(self, postgis: &str) -> StorageSql {
+    pub(crate) fn sql(self, postgis: &str) -> LayoutSql {
         let s = format!("\"{}\"", postgis.replace('"', "\"\""));
         match self {
             Self::Packed => {
@@ -109,7 +109,7 @@ impl Storage {
                         t.name(self)
                     )
                 };
-                StorageSql {
+                LayoutSql {
                     point: "bytea",
                     line: "bytea",
                     ids: "bytea",
@@ -122,7 +122,7 @@ impl Storage {
                     ),
                 }
             }
-            Self::Plain => StorageSql {
+            Self::Plain => LayoutSql {
                 point: "geometry(Point, 4326)",
                 line: "geometry(LineString, 4326)",
                 ids: "int8[]",
@@ -153,7 +153,7 @@ impl DbState {
         }
         let row = client
             .query_opt(
-                "SELECT id, version, rev, url, sequence, (extract(epoch FROM timestamp) * 1000)::int8, storage \
+                "SELECT id, version, rev, url, sequence, (extract(epoch FROM timestamp) * 1000)::int8, tables \
                  FROM osm.state",
                 &[],
             )?
@@ -171,10 +171,10 @@ impl DbState {
             url: row.get(3),
             sequence: row.get(4),
             timestamp: row.get::<_, Option<i64>>(5).map(Timestamp::from_millis),
-            storage: {
+            tables: {
                 let name: &str = row.get(6);
                 name.parse().map_err(|_| {
-                    SyncError::state(format!("unknown storage {name:?} in osm.state"))
+                    SyncError::state(format!("unknown table layout {name:?} in osm.state"))
                 })?
             },
         })
@@ -192,12 +192,12 @@ pub(crate) enum Table {
 }
 
 impl Table {
-    /// The table that stores the rows in `format`: when packed, `osm.nodes_packed` and `osm.ways_packed`, as
+    /// The table that stores the rows in `layout`: when packed, `osm.nodes_packed` and `osm.ways_packed`, as
     /// `osm.nodes` and `osm.ways` are views.
-    pub(crate) fn name(self, format: Storage) -> &'static str {
-        match (self, format) {
-            (Self::Nodes, Storage::Packed) => "osm.nodes_packed",
-            (Self::Ways, Storage::Packed) => "osm.ways_packed",
+    pub(crate) fn name(self, layout: TableLayout) -> &'static str {
+        match (self, layout) {
+            (Self::Nodes, TableLayout::Packed) => "osm.nodes_packed",
+            (Self::Ways, TableLayout::Packed) => "osm.ways_packed",
             _ => self.into(),
         }
     }
@@ -252,14 +252,18 @@ pub(crate) struct Writers {
 }
 
 impl Writers {
-    pub(crate) fn start(url: &str, connections: usize, format: Storage) -> Result<Self, SyncError> {
+    pub(crate) fn start(
+        url: &str,
+        connections: usize,
+        layout: TableLayout,
+    ) -> Result<Self, SyncError> {
         let (tx, rx) = bounded(connections * 4);
         let threads = (0..connections.max(1))
             .map(|i| {
                 let (url, rx) = (url.to_owned(), rx.clone());
                 thread::Builder::new()
                     .name(format!("osmflow-copy-{i}"))
-                    .spawn(move || write(&url, &rx, format))
+                    .spawn(move || write(&url, &rx, layout))
             })
             .collect::<Result<_, _>>()?;
         Ok(Self { tx, threads })
@@ -286,12 +290,12 @@ impl Writers {
 }
 
 /// One connection's work: a `COPY` for each run of rows of one table.
-fn write(url: &str, rx: &Receiver<(Table, Vec<u8>)>, format: Storage) -> Result<(), SyncError> {
+fn write(url: &str, rx: &Receiver<(Table, Vec<u8>)>, layout: TableLayout) -> Result<(), SyncError> {
     let mut client = connect(url)?;
     client.batch_execute("SET synchronous_commit = off; SET default_toast_compression = lz4")?;
     let mut next = rx.recv().ok();
     while let Some((table, buf)) = next {
-        let mut w = copy_in(&mut client, table.name(format), table.columns())?;
+        let mut w = copy_in(&mut client, table.name(layout), table.columns())?;
         w.write_all(&buf)?;
         loop {
             next = rx.recv().ok();
