@@ -11,20 +11,37 @@ pub(crate) fn varint(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
-/// Reads one number from the front of `b`, leaving the rest; 0 if `b` is empty.
+/// Reads one number from the front of `b`, leaving the rest; 0, with nothing left, if `b` is empty or damaged.
 pub(crate) fn read_varint(b: &mut &[u8]) -> u64 {
-    let mut v = 0;
+    if let Some((v, len)) = decode(b) {
+        *b = &b[len..];
+        v
+    } else {
+        *b = &[];
+        0
+    }
+}
+
+/// The number at the front of `src` and its length in bytes; none if `src` ends inside it or it does not fit 64 bits.
+///
+/// The loop sets a flag and breaks rather than returning from inside: that shape compiles to faster code.
+fn decode(src: &[u8]) -> Option<(u64, usize)> {
+    let mut v = 0_u64;
     let mut shift = 0;
-    while let Some((&byte, rest)) = b.split_first() {
-        *b = rest;
-        // Bits past 64, which only damaged bytes have, are dropped
-        v |= u64::from(byte & 0x7f).checked_shl(shift).unwrap_or(0);
-        if byte < 0x80 {
+    let mut done = false;
+    for &byte in src {
+        v |= u64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if shift > 63 {
+            // The tenth byte holds the 64th bit only
+            done = byte < 2;
+            break;
+        } else if byte < 0x80 {
+            done = true;
             break;
         }
-        shift += 7;
     }
-    v
+    done.then_some((v, shift / 7))
 }
 
 /// Maps a signed number to an unsigned one, 0, -1, 1, -2, ... to 0, 1, 2, 3, ...: `(d << 1) ^ (d >> 63)`.
@@ -81,6 +98,22 @@ mod tests {
             assert_eq!(unpack_ids(&packed(ids)), ids);
         }
         assert_eq!(packed(&[]), b"");
+    }
+
+    #[test]
+    fn varints_read_whole_and_damaged() {
+        for v in [0, 1, 127, 128, 300, 1 << 35, u64::MAX] {
+            let mut b = Vec::new();
+            varint(&mut b, v);
+            b.push(0x55);
+            let mut s = &b[..];
+            assert_eq!((read_varint(&mut s), s), (v, &[0x55][..]), "{v}");
+        }
+        // Ends inside a number, or runs past 64 bits
+        for damaged in [&[0x80][..], &[0xff; 10], &[0xff; 11]] {
+            let mut s = damaged;
+            assert_eq!((read_varint(&mut s), s.len()), (0, 0), "{damaged:?}");
+        }
     }
 
     #[test]
