@@ -134,7 +134,7 @@ pub(crate) fn import(
     // their own
     let t = Instant::now();
     let (index, tables) = thread::scope(|s| {
-        let tables = s.spawn(|| finish_tables(&m.url));
+        let tables = s.spawn(|| finish_tables(&m.url, opts.geometry));
         let t = Instant::now();
         let index = pairs.finish().map_err(SyncError::from).and_then(|sorted| {
             ReverseIndex::create(
@@ -303,8 +303,8 @@ fn start(
     }
 }
 
-/// Creates the `osm` schema, with its geometry columns and `osm.geom` for `format`, after dropping an existing one
-/// if `replace`.
+/// Creates the `osm` schema, with `format`'s geometry columns and, for TWKB, the views and `osm.geom`, after dropping
+/// an existing one if `replace`.
 fn create_schema(
     client: &mut Client,
     replace: bool,
@@ -329,11 +329,13 @@ fn create_schema(
             &[],
         )?
         .get(0);
-    let (point, line, geom) = format.sql(&postgis);
+    let sql = format.sql(&postgis);
     let schema = include_str!("schema.sql")
-        .replace("{point}", point)
-        .replace("{line}", line)
-        .replace("{geom_function}", &geom);
+        .replace("{nodes}", Table::Nodes.name(format))
+        .replace("{ways}", Table::Ways.name(format))
+        .replace("{point}", sql.point)
+        .replace("{line}", sql.line)
+        .replace("{views}", &sql.after);
     client.batch_execute(&schema)?;
     Ok(())
 }
@@ -349,7 +351,7 @@ fn copy_objects(
     stats: &mut ImportStats,
     dir: &Path,
 ) -> Result<Sorter, SyncError> {
-    let writers = Writers::start(url, connections)?;
+    let writers = Writers::start(url, connections, format)?;
     let pairs = Sorter::new(dir)?;
     let counts = [const { AtomicU64::new(0) }; 3];
     let read = reader.par_resolve(Select::all(), store, |block, locator| {
@@ -409,9 +411,10 @@ fn copy_objects(
 
 /// Adds the primary keys and analyzes, each table on a connection of its own. Autovacuum, off during the load,
 /// vacuums them later.
-fn finish_tables(url: &str) -> Result<(), SyncError> {
+fn finish_tables(url: &str, format: GeometryFormat) -> Result<(), SyncError> {
     thread::scope(|s| {
         let tables = [Table::Nodes, Table::Ways, Table::Relations].map(|t| {
+            let t = t.name(format);
             s.spawn(move || -> Result<(), SyncError> {
                 let mut client = db::connect(url)?;
                 for sql in [

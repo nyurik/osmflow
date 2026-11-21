@@ -417,7 +417,8 @@ fn rebuild_keeps_repeated_points() {
         return;
     };
     let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
-    for geometry in [GeometryFormat::Twkb, GeometryFormat::Wkb] {
+    // WKB first, so the TWKB import replaces a WKB schema, where the other test replaces a TWKB one
+    for geometry in [GeometryFormat::Wkb, GeometryFormat::Twkb] {
         let dir = tempfile::tempdir().unwrap();
         let diffs = dir.path().join("diffs");
         write_state(&diffs, 708, STATE);
@@ -435,12 +436,15 @@ fn rebuild_keeps_repeated_points() {
         mirror.rebuild(&Rebuild::Database).unwrap();
         assert_same_locations(&mirror, &mut db, &located);
         // A way whose geometry has fewer points than it has nodes fails the rebuild
-        let two = match geometry {
-            GeometryFormat::Twkb => "ST_AsTWKB('LINESTRING(0 0,1 1)'::geometry, 7)",
-            GeometryFormat::Wkb => "'SRID=4326;LINESTRING(0 0,1 1)'::geometry",
+        let (ways, two) = match geometry {
+            GeometryFormat::Twkb => (
+                "osm.ways_twkb",
+                "ST_AsTWKB('LINESTRING(0 0,1 1)'::geometry, 7)",
+            ),
+            GeometryFormat::Wkb => ("osm.ways", "'SRID=4326;LINESTRING(0 0,1 1)'::geometry"),
         };
         db.batch_execute(&format!(
-            "UPDATE osm.ways SET geom = {two} WHERE id = 2000000001"
+            "UPDATE {ways} SET geom = {two} WHERE id = 2000000001"
         ))
         .unwrap();
         fs::remove_file(mirror.index_path()).unwrap();
@@ -537,25 +541,49 @@ fn update_failures(
     );
 }
 
-/// The column `geometry` gives `osm.ways.geom`, and an index on `osm.geom(geom)` serving a query through it.
+/// The tables and views `geometry` makes of `osm.ways`, and an index serving a bbox query on it.
 fn check_geometry(db: &mut Client, geometry: GeometryFormat) {
-    let column = "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
-                  WHERE attrelid = 'osm.ways'::regclass AND attname = 'geom'";
-    let column: String = db.query_one(column, &[]).unwrap().get(0);
-    let expected = match geometry {
-        GeometryFormat::Twkb => "bytea",
-        GeometryFormat::Wkb => "geometry(LineString,4326)",
+    let info = |db: &mut Client, table: &str| -> Option<(String, String)> {
+        let row = db
+            .query_opt(
+                "SELECT c.relkind::text, format_type(a.atttypid, a.atttypmod) FROM pg_class c \
+                 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'geom' WHERE c.oid = to_regclass($1)",
+                &[&table],
+            )
+            .unwrap()?;
+        Some((row.get(0), row.get(1)))
     };
-    assert_eq!(column, expected);
-    // `osm.geom` is inlined, so an index on it serves a query through it, as the database builds it with only
+    let index = match geometry {
+        GeometryFormat::Twkb => {
+            // The stored table has the bytes, and the view decodes them
+            assert_eq!(
+                info(db, "osm.ways_twkb"),
+                Some(("r".into(), "bytea".into()))
+            );
+            assert_eq!(
+                info(db, "osm.nodes_twkb"),
+                Some(("r".into(), "bytea".into()))
+            );
+            let view = info(db, "osm.ways").unwrap();
+            assert_eq!((view.0.as_str(), view.1.ends_with("geometry")), ("v", true));
+            "osm.ways_twkb USING gist (osm.geom(geom))"
+        }
+        GeometryFormat::Wkb => {
+            let line = Some(("r".into(), "geometry(LineString,4326)".into()));
+            assert_eq!(info(db, "osm.ways"), line);
+            assert_eq!(info(db, "osm.ways_twkb"), None);
+            "osm.ways USING gist (geom)"
+        }
+    };
+    // `osm.geom` is inlined, so an index on it serves a query through the view, as the database builds it with only
     // pg_catalog in the search path
-    db.batch_execute(
-        "CREATE INDEX ways_geom ON osm.ways USING gist (osm.geom(geom)); SET enable_seqscan = off",
-    )
+    db.batch_execute(&format!(
+        "CREATE INDEX ways_geom ON {index}; SET enable_seqscan = off"
+    ))
     .unwrap();
     let plan = db
         .query(
-            "EXPLAIN SELECT id FROM osm.ways WHERE osm.geom(geom) && ST_MakeEnvelope(-110, 10, -109, 11, 4326)",
+            "EXPLAIN SELECT id FROM osm.ways WHERE geom && ST_MakeEnvelope(-110, 10, -109, 11, 4326)",
             &[],
         )
         .unwrap();
@@ -660,8 +688,8 @@ fn minor_rev(db: &mut Client, id: i64) -> (i32, i64) {
 /// Every row of the three tables, without `minor` and `rev`, which depend on the batches.
 fn rows(db: &mut Client) -> Vec<String> {
     [
-        "SELECT format('n%s %s %s %s', id, version, tags, ST_AsText(osm.geom(geom))) FROM osm.nodes ORDER BY id",
-        "SELECT format('w%s %s %s %s %s', id, version, tags, nodes, ST_AsText(osm.geom(geom))) FROM osm.ways ORDER BY id",
+        "SELECT format('n%s %s %s %s', id, version, tags, ST_AsText(geom)) FROM osm.nodes ORDER BY id",
+        "SELECT format('w%s %s %s %s %s', id, version, tags, nodes, ST_AsText(geom)) FROM osm.ways ORDER BY id",
         "SELECT format('r%s %s %s %s %s', id, version, tags, member_ids, member_roles) FROM osm.relations ORDER BY id",
     ]
     .iter()
@@ -689,12 +717,9 @@ fn owned((kind, id, action): (&str, i64, &str)) -> (String, i64, String) {
 /// The rows and the change log after diffs 1709 to 1711, one per batch.
 fn check_rows(db: &mut Client) {
     let geom = |db: &mut Client, id: i64| -> Option<String> {
-        db.query_opt(
-            "SELECT ST_AsText(osm.geom(geom)) FROM osm.ways WHERE id = $1",
-            &[&id],
-        )
-        .unwrap()
-        .map(|r| r.get(0))
+        db.query_opt("SELECT ST_AsText(geom) FROM osm.ways WHERE id = $1", &[&id])
+            .unwrap()
+            .map(|r| r.get(0))
     };
     assert!(geom(db, 178_300_745).unwrap().contains("-109.22 10.32"));
     assert!(!geom(db, 210_476_684).unwrap().contains("-109.2 "));

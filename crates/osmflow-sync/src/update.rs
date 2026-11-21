@@ -121,7 +121,7 @@ impl OpenMirror {
         // database did not commit, so the file is opened again on the next update
         let mut store = self.take_node_file(&state, replication)?;
         if !self.temp_tables {
-            create_temp_tables(&mut self.client)?;
+            create_temp_tables(&mut self.client, state.geometry)?;
             self.temp_tables = true;
         }
         let total = apply_diffs(
@@ -404,7 +404,7 @@ fn write(
     plan: &Plan,
     batch: &Batch,
 ) -> Result<u64, SyncError> {
-    let rev = batch.rev;
+    let (rev, format) = (batch.rev, batch.geometry);
     let mut tx = client.transaction()?;
     let mut log = Rows::default();
     let mut rows = 0;
@@ -417,14 +417,17 @@ fn write(
             Vec::new()
         } else {
             tx.query(
-                &format!("DELETE FROM {table} WHERE id = ANY($1) RETURNING id"),
+                &format!(
+                    "DELETE FROM {} WHERE id = ANY($1) RETURNING id",
+                    table.name(format)
+                ),
                 &[&w.deleted],
             )?
         };
         for row in &gone {
             log.row(4).i64(rev).char(kind).i64(row.get(0)).char(b'd');
         }
-        upsert(&mut tx, table, &w.rows)?;
+        upsert(&mut tx, table, format, &w.rows)?;
         for &id in &w.written {
             log.row(4).i64(rev).char(kind).i64(id).char(b'u');
         }
@@ -433,7 +436,10 @@ fn write(
     if plan.geoms.count > 0 {
         db::copy(&mut tx, "osm_geoms", "id, geom", &plan.geoms)?;
         tx.execute(
-            "UPDATE osm.ways w SET geom = g.geom, minor = w.minor + 1, rev = $1 FROM osm_geoms g WHERE w.id = g.id",
+            &format!(
+                "UPDATE {} w SET geom = g.geom, minor = w.minor + 1, rev = $1 FROM osm_geoms g WHERE w.id = g.id",
+                Table::Ways.name(format)
+            ),
             &[&rev],
         )?;
         for &id in &plan.moved_ways {
@@ -467,15 +473,17 @@ fn write(
 }
 
 /// Creates the session's temporary tables that each batch copies its rows into, emptied at every commit.
-fn create_temp_tables(client: &mut Client) -> Result<(), SyncError> {
+fn create_temp_tables(client: &mut Client, format: GeometryFormat) -> Result<(), SyncError> {
     let tables = [Table::Nodes, Table::Ways, Table::Relations].map(|t| {
         format!(
-            "CREATE TEMP TABLE {} (LIKE {t}) ON COMMIT DELETE ROWS;",
-            temp_name(t)
+            "CREATE TEMP TABLE {} (LIKE {}) ON COMMIT DELETE ROWS;",
+            temp_name(t),
+            t.name(format)
         )
     });
     client.batch_execute(&format!(
-        "CREATE TEMP TABLE osm_geoms ON COMMIT DELETE ROWS AS SELECT id, geom FROM osm.ways WITH NO DATA; {}",
+        "CREATE TEMP TABLE osm_geoms ON COMMIT DELETE ROWS AS SELECT id, geom FROM {} WITH NO DATA; {}",
+        Table::Ways.name(format),
         tables.concat()
     ))?;
     Ok(())
@@ -488,7 +496,12 @@ fn temp_name(table: Table) -> String {
 
 /// Writes `rows` of `table` over the rows with their IDs, or as new rows: copied into its temporary table, then
 /// merged.
-fn upsert(tx: &mut Transaction<'_>, table: Table, rows: &Rows) -> Result<(), SyncError> {
+fn upsert(
+    tx: &mut Transaction<'_>,
+    table: Table,
+    format: GeometryFormat,
+    rows: &Rows,
+) -> Result<(), SyncError> {
     if rows.count == 0 {
         return Ok(());
     }
@@ -497,7 +510,7 @@ fn upsert(tx: &mut Transaction<'_>, table: Table, rows: &Rows) -> Result<(), Syn
     let rest = list.strip_prefix("id, ").unwrap_or(list);
     let new = rest.replace(", ", ", EXCLUDED.");
     db::copy(tx, &tmp, list, rows)?;
-    tx.execute(&format!("INSERT INTO {table} ({list}) SELECT {list} FROM {tmp} ON CONFLICT (id) DO UPDATE SET ({rest}) = ROW(EXCLUDED.{new})"), &[])?;
+    tx.execute(&format!("INSERT INTO {} ({list}) SELECT {list} FROM {tmp} ON CONFLICT (id) DO UPDATE SET ({rest}) = ROW(EXCLUDED.{new})", table.name(format)), &[])?;
     Ok(())
 }
 

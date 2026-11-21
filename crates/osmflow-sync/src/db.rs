@@ -12,7 +12,7 @@ use crate::copy::{HEADER, Rows, TRAILER};
 pub(crate) use crate::tls::connect;
 
 /// The format of the `osm` schema this crate reads and writes.
-pub(crate) const SCHEMA_VERSION: i32 = 2;
+pub(crate) const SCHEMA_VERSION: i32 = 3;
 
 /// Where the database is in its replication stream, from `osm.state`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,8 +33,10 @@ pub struct DbState {
 
 /// How `osm.nodes` and `osm.ways` store their geometries: chosen by the import, kept by every update.
 ///
-/// SQL reads either the same way through `osm.geom(geom)`, which the import creates for the format: it decodes TWKB,
-/// or gives the geometry as it is. It is inlined, so an index on `osm.geom(geom)` serves both.
+/// SQL reads `geom` of `osm.nodes` and `osm.ways` as a PostGIS geometry in either format. With TWKB the tables are
+/// `osm.nodes_twkb` and `osm.ways_twkb`, and `osm.nodes` and `osm.ways` are views over them that decode `geom` with
+/// `osm.geom(geom)`. That function is inlined, so an index on `osm.ways_twkb (osm.geom(geom))` serves queries on the
+/// view `osm.ways`; with WKB the index is on `osm.ways (geom)`.
 ///
 /// It displays and parses as `twkb` or `wkb`, its name in `osm.state`.
 #[derive(
@@ -53,37 +55,58 @@ pub struct DbState {
 #[strum(serialize_all = "lowercase")]
 pub enum GeometryFormat {
     /// TWKB with OSM's 7 decimal digits in a `bytea`, which PostGIS reads exactly as the locations were written:
-    /// about a quarter of the size of a line's WKB.
+    /// about a quarter of the size of a line's WKB. Read through the views `osm.nodes` and `osm.ways`.
     #[default]
     Twkb,
-    /// PostGIS's `geometry` with SRID 4326, stored as WKB: read without decoding.
+    /// PostGIS's `geometry` with SRID 4326, stored as WKB in `osm.nodes` and `osm.ways`: read without decoding.
     Wkb,
 }
 
+/// The SQL of a [`GeometryFormat`], for `schema.sql`.
+pub(crate) struct GeometrySql {
+    /// The column type of a point.
+    pub(crate) point: &'static str,
+    /// The column type of a line string.
+    pub(crate) line: &'static str,
+    /// What goes after the tables: `osm.geom` and the views `osm.nodes` and `osm.ways` over the TWKB tables; nothing
+    /// for WKB.
+    pub(crate) after: String,
+}
+
 impl GeometryFormat {
-    /// The column types of a point and a line string, and `osm.geom` for them, with PostGIS in schema `postgis`.
+    /// The column types, and the function and views, with PostGIS in schema `postgis`.
     ///
     /// The function's body names PostGIS's schema: Postgres reads it again where it inlines it, and builds indexes
     /// with only `pg_catalog` in the search path.
-    pub(crate) fn sql(self, postgis: &str) -> (&'static str, &'static str, String) {
+    pub(crate) fn sql(self, postgis: &str) -> GeometrySql {
         let s = format!("\"{}\"", postgis.replace('"', "\"\""));
         match self {
-            Self::Twkb => (
-                "bytea",
-                "bytea",
-                format!(
-                    "CREATE FUNCTION osm.geom(g bytea) RETURNS {s}.geometry LANGUAGE sql IMMUTABLE PARALLEL SAFE \
-                     AS $$ SELECT {s}.ST_SetSRID({s}.ST_GeomFromTWKB(g), 4326) $$;"
-                ),
-            ),
-            Self::Wkb => (
-                "geometry(Point, 4326)",
-                "geometry(LineString, 4326)",
-                format!(
-                    "CREATE FUNCTION osm.geom(g {s}.geometry) RETURNS {s}.geometry LANGUAGE sql IMMUTABLE \
-                     PARALLEL SAFE AS $$ SELECT g $$;"
-                ),
-            ),
+            Self::Twkb => {
+                // `geom` is the last column
+                let view = |t: Table| {
+                    let rest = t.columns().strip_suffix("geom").unwrap_or_default();
+                    format!(
+                        "CREATE VIEW {} AS SELECT {rest}osm.geom(geom) AS geom FROM {};",
+                        <&str>::from(t),
+                        t.name(self)
+                    )
+                };
+                GeometrySql {
+                    point: "bytea",
+                    line: "bytea",
+                    after: format!(
+                        "CREATE FUNCTION osm.geom(g bytea) RETURNS {s}.geometry LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+                         AS $$ SELECT {s}.ST_SetSRID({s}.ST_GeomFromTWKB(g), 4326) $$;\n{}\n{}",
+                        view(Table::Nodes),
+                        view(Table::Ways)
+                    ),
+                }
+            }
+            Self::Wkb => GeometrySql {
+                point: "geometry(Point, 4326)",
+                line: "geometry(LineString, 4326)",
+                after: String::new(),
+            },
         }
     }
 }
@@ -109,7 +132,8 @@ impl DbState {
         let version: i32 = row.get(1);
         if version != SCHEMA_VERSION {
             return Err(SyncError::state(format!(
-                "the osm schema has format {version}, but this osmflow-sync reads {SCHEMA_VERSION}"
+                "the osm schema has format {version}, but this osmflow-sync reads {SCHEMA_VERSION}: import again, \
+                 replacing the osm schema"
             )));
         }
         Ok(Self {
@@ -128,8 +152,9 @@ impl DbState {
     }
 }
 
-/// A table rows are copied into, named as `osm.nodes`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
+/// A table rows are copied into. `<&str>::from` gives the name SQL users read, `osm.nodes`; [`Table::name`] the table
+/// that stores the rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "lowercase", prefix = "osm.")]
 pub(crate) enum Table {
     Nodes,
@@ -138,6 +163,16 @@ pub(crate) enum Table {
 }
 
 impl Table {
+    /// The table that stores the rows in `format`: with TWKB, `osm.nodes_twkb` and `osm.ways_twkb`, as `osm.nodes` and
+    /// `osm.ways` are views.
+    pub(crate) fn name(self, format: GeometryFormat) -> &'static str {
+        match (self, format) {
+            (Self::Nodes, GeometryFormat::Twkb) => "osm.nodes_twkb",
+            (Self::Ways, GeometryFormat::Twkb) => "osm.ways_twkb",
+            _ => self.into(),
+        }
+    }
+
     /// The table's columns, in the order rows are encoded, as a list for SQL: `id` first, then the rest after `, `.
     pub(crate) fn columns(self) -> &'static str {
         match self {
@@ -188,14 +223,18 @@ pub(crate) struct Writers {
 }
 
 impl Writers {
-    pub(crate) fn start(url: &str, connections: usize) -> Result<Self, SyncError> {
+    pub(crate) fn start(
+        url: &str,
+        connections: usize,
+        format: GeometryFormat,
+    ) -> Result<Self, SyncError> {
         let (tx, rx) = bounded(connections * 4);
         let threads = (0..connections.max(1))
             .map(|i| {
                 let (url, rx) = (url.to_owned(), rx.clone());
                 thread::Builder::new()
                     .name(format!("osmflow-copy-{i}"))
-                    .spawn(move || write(&url, &rx))
+                    .spawn(move || write(&url, &rx, format))
             })
             .collect::<Result<_, _>>()?;
         Ok(Self { tx, threads })
@@ -222,12 +261,16 @@ impl Writers {
 }
 
 /// One connection's work: a `COPY` for each run of rows of one table.
-fn write(url: &str, rx: &Receiver<(Table, Vec<u8>)>) -> Result<(), SyncError> {
+fn write(
+    url: &str,
+    rx: &Receiver<(Table, Vec<u8>)>,
+    format: GeometryFormat,
+) -> Result<(), SyncError> {
     let mut client = connect(url)?;
     client.batch_execute("SET synchronous_commit = off; SET default_toast_compression = lz4")?;
     let mut next = rx.recv().ok();
     while let Some((table, buf)) = next {
-        let mut w = copy_in(&mut client, table.into(), table.columns())?;
+        let mut w = copy_in(&mut client, table.name(format), table.columns())?;
         w.write_all(&buf)?;
         loop {
             next = rx.recv().ok();

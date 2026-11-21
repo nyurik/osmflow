@@ -14,7 +14,7 @@ CREATE TABLE osm.state (
     url       text,
     sequence  int8        NOT NULL,
     timestamp timestamptz,
-    -- How `nodes` and `ways` store their geometries: 'twkb' or 'wkb'
+    -- How `osm.nodes` and `osm.ways` store their geometries: 'twkb' or 'wkb'
     geometry  text        NOT NULL
 );
 
@@ -31,19 +31,19 @@ CREATE TABLE osm.batches (
 );
 
 -- Tagged nodes. Untagged nodes are only in the node file.
-CREATE TABLE osm.nodes (
+CREATE TABLE {nodes} (
     id        int8  NOT NULL,
     version   int4,
     changeset int8,
     ts        timestamptz,
     rev       int8  NOT NULL,
     tags      jsonb NOT NULL,
-    -- The location, as `geometry` reads it (`osm.geom(geom)`)
+    -- The location
     geom      {point}
 ) WITH (autovacuum_enabled = off);
 
 -- Every way. `minor` counts the changes of its geometry since its version: a node of it moved or was deleted.
-CREATE TABLE osm.ways (
+CREATE TABLE {ways} (
     id        int8   NOT NULL,
     version   int4,
     changeset int8,
@@ -52,8 +52,7 @@ CREATE TABLE osm.ways (
     rev       int8   NOT NULL,
     tags      jsonb  NOT NULL,
     nodes     int8[] NOT NULL,
-    -- The line, one point per node, as `geometry` reads it (`osm.geom(geom)`); NULL when a node is missing or the
-    -- way has fewer than two
+    -- The line, one point per node; NULL when a node is missing or the way has fewer than two
     geom      {line}
 ) WITH (autovacuum_enabled = off);
 
@@ -82,5 +81,5 @@ CREATE TABLE osm.changes (
 );
 CREATE INDEX ON osm.changes (rev);
 
--- `geom` of `nodes` and `ways` as a geometry, whichever way it is stored
-{geom_function}
+-- With TWKB, `osm.nodes` and `osm.ways` are views of the tables above that decode `geom`
+{views}

@@ -76,10 +76,11 @@ enum Command {
         /// Database connections to copy on at once; half the cores, up to 8, by default.
         #[arg(long, value_name = "N")]
         connections: Option<usize>,
-        /// How to store the geometries of nodes and ways, from then on; SQL reads either with `osm.geom(geom)`.
+        /// How to store the geometries of nodes and ways, from then on.
         ///
-        /// `twkb` is TWKB with OSM's 7 decimal digits, in a `bytea`: about a quarter of a line's WKB. `wkb` is
-        /// PostGIS's `geometry`, read without decoding.
+        /// `osm.nodes` and `osm.ways` read as geometries either way. `twkb` is TWKB with OSM's 7 decimal digits, in a `bytea`: about a quarter of a line's WKB. Its tables are
+        /// `osm.nodes_twkb` and `osm.ways_twkb`, and `osm.nodes` and `osm.ways` are views that decode them. `wkb` is
+        /// PostGIS's `geometry`, read without decoding, in `osm.nodes` and `osm.ways`.
         #[arg(long, default_value_t, value_parser = names::<GeometryFormat>())]
         geometry: GeometryFormat,
     },

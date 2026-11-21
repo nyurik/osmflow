@@ -17,7 +17,7 @@ use tracing::info;
 use wkb::reader::read_wkb;
 
 use crate::copy::{locations, osm_twkb};
-use crate::db::{self, DbState};
+use crate::db::{self, DbState, Table};
 use crate::files::{ID_KEY, read_diffs, remove_node_file, set_locations, way_pairs};
 use crate::index::ReverseIndex;
 use crate::sort::{Sorted, Sorter};
@@ -157,8 +157,14 @@ fn db_locations(
         GeometryFormat::Wkb => "ST_AsBinary(geom)",
     };
     for sql in [
-        format!("SELECT 'way', id, nodes, {geom} FROM osm.ways WHERE geom IS NOT NULL"),
-        format!("SELECT 'node', id, ARRAY[id], {geom} FROM osm.nodes WHERE geom IS NOT NULL"),
+        format!(
+            "SELECT 'way', id, nodes, {geom} FROM {} WHERE geom IS NOT NULL",
+            Table::Ways.name(format)
+        ),
+        format!(
+            "SELECT 'node', id, ARRAY[id], {geom} FROM {} WHERE geom IS NOT NULL",
+            Table::Nodes.name(format)
+        ),
     ] {
         let mut rows = client.query_raw(&sql, iter::empty::<&str>())?;
         while let Some(row) = rows.next()? {
