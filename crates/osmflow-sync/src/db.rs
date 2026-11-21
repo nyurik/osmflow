@@ -5,28 +5,14 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use osmflow::Timestamp;
-use postgres::{Client, CopyInWriter, GenericClient};
+use postgres::{CopyInWriter, GenericClient};
 
 use crate::SyncError;
 use crate::copy::{HEADER, Rows, TRAILER};
+pub(crate) use crate::tls::connect;
 
 /// The format of the `osm` schema this crate reads and writes.
 pub(crate) const SCHEMA_VERSION: i32 = 2;
-
-/// Connects to the database at `url`: with TLS as its `sslmode` and `sslrootcert` ask with the `tls` feature, and
-/// without TLS otherwise.
-pub(crate) fn connect(url: &str) -> Result<Client, SyncError> {
-    #[cfg(feature = "tls")]
-    {
-        use crate::tls;
-        tls::connect(url)
-    }
-    #[cfg(not(feature = "tls"))]
-    {
-        use postgres::NoTls;
-        Ok(Client::connect(url, NoTls)?)
-    }
-}
 
 /// Where the database is in its replication stream, from `osm.state`.
 #[derive(Debug, Clone, PartialEq, Eq)]

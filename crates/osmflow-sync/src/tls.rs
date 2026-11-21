@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
 use postgres::config::SslMode as PgSslMode;
-use postgres::{Client, Config, NoTls};
+use postgres::{Client, Config};
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{
@@ -83,12 +83,9 @@ impl SslMode {
 /// Connects as `url` asks, `sslmode` and `sslrootcert` included.
 pub(crate) fn connect(url: &str) -> Result<Client, SyncError> {
     let (config, mode, root_cert) = parse(url)?;
-    if mode == SslMode::Disable {
-        Ok(config.connect(NoTls)?)
-    } else {
-        let tls = MakeRustlsConnect::new(client_config(mode, root_cert.as_deref())?);
-        Ok(config.connect(tls)?)
-    }
+    // With `disable`, `postgres` does not use it
+    let tls = MakeRustlsConnect::new(client_config(mode, root_cert.as_deref())?);
+    Ok(config.connect(tls)?)
 }
 
 /// The connection string without `sslmode` and `sslrootcert`, parsed, with the mode `postgres` is to use, and both.

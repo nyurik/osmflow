@@ -25,8 +25,8 @@ doc = false
 default = ["http", "sync"]
 # Reading replication streams from servers; without it, an http:// or https:// input is an error
 http = ["osmflow/http"]
-# `osmflow sync`: OpenStreetMap data in PostgreSQL, with TLS as the connection string's `sslmode` asks
-sync = ["dep:osmflow-sync", "osmflow-sync/signals", "osmflow-sync/tls"]
+# `osmflow sync`: OpenStreetMap data in PostgreSQL
+sync = ["dep:osmflow-sync", "osmflow-sync/signals"]
 
 [dependencies]
 anyhow.workspace = true

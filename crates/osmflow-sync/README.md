@@ -149,8 +149,8 @@ the database's identity, a random number made by the import, and the revision it
 ## Connections
 
 The database is given as libpq takes it: `postgresql://user:password@host:port/db?param=value`, or
-`host=… user=… dbname=…`. With the `tls` feature (`features = ["tls"]`; the `osmflow` command has it), connections
-use TLS as the `sslmode` parameter asks, with [rustls](https://crates.io/crates/rustls), as libpq does:
+`host=… user=… dbname=…`. Connections use TLS as its `sslmode` parameter asks, with
+[rustls](https://crates.io/crates/rustls), as libpq does:
 
 | `sslmode` | TLS | The server's certificate |
 |---|---|---|
@@ -166,8 +166,7 @@ its managed databases: `postgresql://user@host/osm?sslmode=verify-full&sslrootce
 can. `verify-ca` needs `sslrootcert`, as the system's authorities would accept a certificate for any host. libpq's
 `allow`, client certificates (`sslcert`, `sslkey`) and its environment variables (`PGSSLMODE` and the others) are not
 supported, nor is its `sslrootcert=system`: `verify-full` without `sslrootcert` uses the system's authorities, where
-libpq would read `~/.postgresql/root.crt`, which is never read here. Without the `tls` feature, connections are not encrypted, and a connection string that asks for TLS is an
-error.
+libpq would read `~/.postgresql/root.crt`, which is never read here.
 
 ## Performance
 

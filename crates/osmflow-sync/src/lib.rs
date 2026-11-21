@@ -10,7 +10,6 @@ mod index;
 mod rebuild;
 mod sort;
 mod stop;
-#[cfg(feature = "tls")]
 mod tls;
 mod update;
 
@@ -30,7 +29,6 @@ pub use crate::rebuild::{Rebuild, RebuildStats};
 #[cfg(feature = "signals")]
 pub use crate::stop::{Signal, SignalError, SignalGuard};
 pub use crate::stop::{Stop, StopReason};
-#[cfg(feature = "tls")]
 pub use crate::tls::TlsError;
 pub use crate::update::{UpdateOpts, UpdateStats};
 
@@ -73,8 +71,8 @@ pub struct Status {
 
 impl Mirror {
     /// A mirror in the database at `url` (`postgresql://user@host/db`, or `host=… user=…`), with its files in `dir`.
-    /// With the `tls` feature, connections use TLS as its `sslmode` and `sslrootcert` ask, as the
-    /// [connections](crate#connections) section says; without it, they are not encrypted.
+    /// Connections use TLS as its `sslmode` and `sslrootcert` ask, as the [connections](crate#connections) section
+    /// says.
     pub fn new(url: impl Into<String>, dir: impl Into<PathBuf>) -> Self {
         Self {
             url: url.into(),
