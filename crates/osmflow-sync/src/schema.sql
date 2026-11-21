@@ -14,8 +14,8 @@ CREATE TABLE osm.state (
     url       text,
     sequence  int8        NOT NULL,
     timestamp timestamptz,
-    -- How `osm.nodes` and `osm.ways` store their geometries: 'twkb' or 'wkb'
-    geometry  text        NOT NULL
+    -- How `osm.nodes` and `osm.ways` store their rows: 'packed' or 'plain'
+    storage   text        NOT NULL
 );
 
 -- One row per revision: the import, then each update batch.
@@ -51,7 +51,7 @@ CREATE TABLE {ways} (
     minor     int4   NOT NULL,
     rev       int8   NOT NULL,
     tags      jsonb  NOT NULL,
-    nodes     int8[] NOT NULL,
+    nodes     {ids}  NOT NULL,
     -- The line, one point per node; NULL when a node is missing or the way has fewer than two
     geom      {line}
 ) WITH (autovacuum_enabled = off);
@@ -81,5 +81,6 @@ CREATE TABLE osm.changes (
 );
 CREATE INDEX ON osm.changes (rev);
 
--- With TWKB, `osm.nodes` and `osm.ways` are views of the tables above that decode `geom`
+-- When packed: `osm.geom`, `osm.node_ids`, and the views `osm.nodes` and `osm.ways` of the tables above that decode
+-- `geom` and `nodes`
 {views}

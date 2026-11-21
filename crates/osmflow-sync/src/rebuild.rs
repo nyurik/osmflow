@@ -22,7 +22,7 @@ use crate::files::{ID_KEY, read_diffs, remove_node_file, set_locations, way_pair
 use crate::index::ReverseIndex;
 use crate::sort::{Sorted, Sorter};
 use crate::update::check_stream;
-use crate::{GeometryFormat, Mirror, SyncError};
+use crate::{Mirror, Storage, SyncError};
 
 /// Where [`Mirror::rebuild`] takes node locations from. The reverse index is always made from the database's ways.
 #[derive(Clone, Copy)]
@@ -70,7 +70,7 @@ pub(crate) fn rebuild(m: &Mirror, from: &Rebuild<'_>) -> Result<RebuildStats, Sy
             let mut load = store.bulk_load()?;
             let mut batch = Vec::with_capacity(1 << 20);
             let mut last = None;
-            for node in db_locations(&mut client, &m.dir, state.geometry)? {
+            for node in db_locations(&mut client, &m.dir, state.storage)? {
                 // A node of several ways has the same location in each; one is enough
                 let (id, loc) = node?;
                 if last != Some(id) {
@@ -133,7 +133,7 @@ pub(crate) fn rebuild(m: &Mirror, from: &Rebuild<'_>) -> Result<RebuildStats, Sy
     );
 
     let t = Instant::now();
-    let pairs = db_pairs(&mut client, &m.dir)?.map(|p| p.map_err(SyncError::from));
+    let pairs = db_pairs(&mut client, &m.dir, state.storage)?.map(|p| p.map_err(SyncError::from));
     made.pairs = ReverseIndex::create(&m.index_path(), state.id, state.rev, pairs)?.1;
     info!(
         pairs = made.pairs,
@@ -144,38 +144,44 @@ pub(crate) fn rebuild(m: &Mirror, from: &Rebuild<'_>) -> Result<RebuildStats, Sy
 }
 
 /// The node locations the database has, as (ID, packed location), sorted, sorted with temporary files in `dir`.
-fn db_locations(
-    client: &mut Client,
-    dir: &Path,
-    format: GeometryFormat,
-) -> Result<Sorted, SyncError> {
+fn db_locations(client: &mut Client, dir: &Path, format: Storage) -> Result<Sorted, SyncError> {
     let sorter = Sorter::new(dir)?;
     // The ways' points, then the tagged nodes': (kind, ID, node IDs, geometry) rows, every point as stored. Not
     // through `ST_AsTWKB`, which leaves out a point that repeats the one before it.
     let geom = match format {
-        GeometryFormat::Twkb => "geom",
-        GeometryFormat::Wkb => "ST_AsBinary(geom)",
+        Storage::Packed => "geom",
+        Storage::Plain => "ST_AsBinary(geom)",
     };
-    for sql in [
-        format!(
-            "SELECT 'way', id, nodes, {geom} FROM {} WHERE geom IS NOT NULL",
-            Table::Ways.name(format)
+    for (is_way, sql) in [
+        (
+            true,
+            format!(
+                "SELECT 'way', id, nodes, {geom} FROM {} WHERE geom IS NOT NULL",
+                Table::Ways.name(format)
+            ),
         ),
-        format!(
-            "SELECT 'node', id, ARRAY[id], {geom} FROM {} WHERE geom IS NOT NULL",
-            Table::Nodes.name(format)
+        (
+            false,
+            format!(
+                "SELECT 'node', id, id, {geom} FROM {} WHERE geom IS NOT NULL",
+                Table::Nodes.name(format)
+            ),
         ),
     ] {
         let mut rows = client.query_raw(&sql, iter::empty::<&str>())?;
         while let Some(row) = rows.next()? {
-            let nodes: Vec<i64> = row.get(2);
+            let nodes = if is_way {
+                format.node_ids(&row, 2)
+            } else {
+                vec![row.get(2)]
+            };
             let buf: &[u8] = row.get(3);
             let added = match format {
-                GeometryFormat::Twkb => {
+                Storage::Packed => {
                     let g = osm_twkb(buf);
                     add_locations(&sorter, &nodes, g.as_ref().map(locations))?
                 }
-                GeometryFormat::Wkb => match read_wkb(buf).as_ref().map(|g| g.as_type()) {
+                Storage::Plain => match read_wkb(buf).as_ref().map(|g| g.as_type()) {
                     Ok(GeometryType::Point(p)) => {
                         add_locations(&sorter, &nodes, Some(p.coord().iter().map(location)))?
                     }
@@ -216,12 +222,13 @@ fn add_locations(
     Ok(true)
 }
 
-/// The reverse index's pairs, from the ways' node lists, sorted with temporary files in `dir`.
-fn db_pairs(client: &mut Client, dir: &Path) -> Result<Sorted, SyncError> {
+/// The reverse index's pairs, from the ways' node lists in the tables of `storage`, sorted with temporary files in `dir`.
+fn db_pairs(client: &mut Client, dir: &Path, storage: Storage) -> Result<Sorted, SyncError> {
     let sorter = Sorter::new(dir)?;
-    let mut rows = client.query_raw("SELECT id, nodes FROM osm.ways", iter::empty::<&str>())?;
+    let sql = format!("SELECT id, nodes FROM {}", Table::Ways.name(storage));
+    let mut rows = client.query_raw(&sql, iter::empty::<&str>())?;
     while let Some(row) = rows.next()? {
-        sorter.extend(way_pairs(row.get(0), &row.get::<_, Vec<i64>>(1)))?;
+        sorter.extend(way_pairs(row.get(0), &storage.node_ids(&row, 1)))?;
     }
     Ok(sorter.finish()?)
 }

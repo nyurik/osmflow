@@ -11,8 +11,8 @@ use anyhow::{Context as _, Result};
 use osmflow::PbfReader;
 use osmflow::osc::Replication;
 use osmflow_sync::{
-    DbState, FileStamp, FollowOpts, GeometryFormat, ImportOpts, Mirror, Rebuild, Signal, Stop,
-    StopReason, SyncError, UpdateOpts,
+    DbState, FileStamp, FollowOpts, ImportOpts, Mirror, Rebuild, Signal, Stop, StopReason, Storage,
+    SyncError, UpdateOpts,
 };
 
 use crate::input::fetch;
@@ -76,13 +76,17 @@ enum Command {
         /// Database connections to copy on at once; half the cores, up to 8, by default.
         #[arg(long, value_name = "N")]
         connections: Option<usize>,
-        /// How to store the geometries of nodes and ways, from then on.
+        /// How `osm.nodes` and `osm.ways` store their rows, from then on.
         ///
-        /// `osm.nodes` and `osm.ways` read as geometries either way. `twkb` is TWKB with OSM's 7 decimal digits, in a `bytea`: about a quarter of a line's WKB. Its tables are
-        /// `osm.nodes_twkb` and `osm.ways_twkb`, and `osm.nodes` and `osm.ways` are views that decode them. `wkb` is
-        /// PostGIS's `geometry`, read without decoding, in `osm.nodes` and `osm.ways`.
-        #[arg(long, default_value_t, value_parser = names::<GeometryFormat>())]
-        geometry: GeometryFormat,
+        /// Either way, SQL reads them with `geom` as a geometry and a way's `nodes` as an `int8[]`. `packed` makes
+        /// the tables `osm.nodes_packed` and `osm.ways_packed`, with TWKB geometries and node lists as varints, and
+        /// views `osm.nodes` and `osm.ways` that decode them with `osm.geom` and `osm.node_ids`: in the District of
+        /// Columbia, TWKB is 11.5 MB against 48.3 MB of WKB, and the ways' node lists 6.0 MB against 25.9 MB. Bulk
+        /// readers should read `osm.ways_packed` and decode the node bytes themselves, as `osm.node_ids` takes about
+        /// 1.3 µs per node. `plain` stores PostGIS geometries and `int8[]` in `osm.nodes` and `osm.ways`, read without
+        /// decoding.
+        #[arg(long, default_value_t, value_parser = names::<Storage>())]
+        storage: Storage,
     },
     /// Applies the replication diffs after the database's sequence, up to the latest.
     ///
@@ -144,13 +148,13 @@ pub fn run(args: &Args) -> Result<ExitCode> {
             sequence,
             cache,
             connections,
-            geometry,
+            storage,
         } => {
             let mut opts = ImportOpts {
                 replace: *replace,
                 replication_url: replication.clone(),
                 sequence: *sequence,
-                geometry: *geometry,
+                storage: *storage,
                 ..ImportOpts::default()
             };
             if let Some(n) = connections {
@@ -473,7 +477,7 @@ mod tests {
             );
             s.db.sequence
         };
-        for geometry in ["twkb", "wkb"] {
+        for storage in ["packed", "plain"] {
             sync(
                 &[
                     &["import"],
@@ -483,16 +487,16 @@ mod tests {
                         "--replace",
                         "--replication",
                         diffs,
-                        "--geometry",
-                        geometry,
+                        "--storage",
+                        storage,
                     ],
                 ]
                 .concat(),
             );
-            assert_eq!(at(1), 1708, "{geometry}");
-            assert_eq!(mirror.state().unwrap().geometry.to_string(), geometry);
+            assert_eq!(at(1), 1708, "{storage}");
+            assert_eq!(mirror.state().unwrap().storage.to_string(), storage);
             sync(&[&["update"], &place[..]].concat());
-            assert_eq!(at(2), 1709, "{geometry}");
+            assert_eq!(at(2), 1709, "{storage}");
             let way = NodeWay {
                 node: NODE,
                 way: 178_300_745,
@@ -503,7 +507,7 @@ mod tests {
             for from in [&[][..], &["--pbf", PBF][..]] {
                 fs::remove_file(mirror.index_path()).unwrap();
                 sync(&[&["rebuild"], &place[..], from].concat());
-                assert_eq!(at(2), 1709, "{geometry} {from:?}");
+                assert_eq!(at(2), 1709, "{storage} {from:?}");
             }
         }
     }

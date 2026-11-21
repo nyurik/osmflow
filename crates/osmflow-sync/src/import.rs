@@ -18,7 +18,7 @@ use crate::db::{self, DbState, SCHEMA_VERSION, Table, Writers};
 use crate::files::{ID_KEY, remove_node_file};
 use crate::index::{self, ReverseIndex};
 use crate::sort::Sorter;
-use crate::{GeometryFormat, Mirror, SyncError};
+use crate::{Mirror, Storage, SyncError};
 
 /// The revision of the imported data.
 pub(crate) const IMPORT_REV: i64 = 1;
@@ -36,8 +36,8 @@ pub struct ImportOpts {
     pub sequence: Option<u64>,
     /// The database connections rows are copied on, at once.
     pub connections: usize,
-    /// How `osm.nodes` and `osm.ways` store their geometries, from then on: TWKB by default.
-    pub geometry: GeometryFormat,
+    /// How `osm.nodes` and `osm.ways` store their rows, from then on; packed by default: see [`Storage`].
+    pub storage: Storage,
 }
 
 impl Default for ImportOpts {
@@ -47,7 +47,7 @@ impl Default for ImportOpts {
             replication_url: None,
             sequence: None,
             connections: crate::default_connections(),
-            geometry: GeometryFormat::default(),
+            storage: Storage::default(),
         }
     }
 }
@@ -93,7 +93,7 @@ pub(crate) fn import(
         .or_else(|| header.replication_base_url.clone());
 
     let mut client = db::connect(&m.url)?;
-    create_schema(&mut client, opts.replace, opts.geometry)?;
+    create_schema(&mut client, opts.replace, opts.storage)?;
     fs::create_dir_all(&m.dir)?;
     remove_node_file(&m.node_path())?;
     index::remove(&m.index_path())?;
@@ -118,7 +118,7 @@ pub(crate) fn import(
         &store,
         &m.url,
         opts.connections,
-        opts.geometry,
+        opts.storage,
         &mut stats,
         &m.dir,
     )?;
@@ -134,7 +134,7 @@ pub(crate) fn import(
     // their own
     let t = Instant::now();
     let (index, tables) = thread::scope(|s| {
-        let tables = s.spawn(|| finish_tables(&m.url, opts.geometry));
+        let tables = s.spawn(|| finish_tables(&m.url, opts.storage));
         let t = Instant::now();
         let index = pairs.finish().map_err(SyncError::from).and_then(|sorted| {
             ReverseIndex::create(
@@ -168,7 +168,7 @@ pub(crate) fn import(
         url,
         sequence,
         timestamp,
-        geometry: opts.geometry,
+        storage: opts.storage,
     };
     record(&mut client, &position, &stats)?;
     Ok(stats)
@@ -191,7 +191,7 @@ fn record(client: &mut Client, at: &DbState, loaded: &ImportStats) -> Result<(),
         ],
     )?;
     tx.execute(
-        "INSERT INTO osm.state (id, version, rev, url, sequence, timestamp, geometry) \
+        "INSERT INTO osm.state (id, version, rev, url, sequence, timestamp, storage) \
          VALUES ($1, $2, $3, $4, $5, to_timestamp($6::int8 / 1000.0), $7)",
         &[
             &at.id,
@@ -200,7 +200,7 @@ fn record(client: &mut Client, at: &DbState, loaded: &ImportStats) -> Result<(),
             &at.url,
             &at.sequence,
             &timestamp,
-            &at.geometry.as_ref(),
+            &at.storage.as_ref(),
         ],
     )?;
     tx.commit()?;
@@ -303,13 +303,9 @@ fn start(
     }
 }
 
-/// Creates the `osm` schema, with `format`'s geometry columns and, for TWKB, the views and `osm.geom`, after dropping
+/// Creates the `osm` schema, with `format`'s column types and, when packed, the functions and views, after dropping
 /// an existing one if `replace`.
-fn create_schema(
-    client: &mut Client,
-    replace: bool,
-    format: GeometryFormat,
-) -> Result<(), SyncError> {
+fn create_schema(client: &mut Client, replace: bool, format: Storage) -> Result<(), SyncError> {
     if replace {
         client.batch_execute("DROP SCHEMA IF EXISTS osm CASCADE")?;
     } else if client
@@ -335,6 +331,7 @@ fn create_schema(
         .replace("{ways}", Table::Ways.name(format))
         .replace("{point}", sql.point)
         .replace("{line}", sql.line)
+        .replace("{ids}", sql.ids)
         .replace("{views}", &sql.after);
     client.batch_execute(&schema)?;
     Ok(())
@@ -347,7 +344,7 @@ fn copy_objects(
     store: &PagedStore,
     url: &str,
     connections: usize,
-    format: GeometryFormat,
+    format: Storage,
     stats: &mut ImportStats,
     dir: &Path,
 ) -> Result<Sorter, SyncError> {
@@ -411,7 +408,7 @@ fn copy_objects(
 
 /// Adds the primary keys and analyzes, each table on a connection of its own. Autovacuum, off during the load,
 /// vacuums them later.
-fn finish_tables(url: &str, format: GeometryFormat) -> Result<(), SyncError> {
+fn finish_tables(url: &str, format: Storage) -> Result<(), SyncError> {
     thread::scope(|s| {
         let tables = [Table::Nodes, Table::Ways, Table::Relations].map(|t| {
             let t = t.name(format);

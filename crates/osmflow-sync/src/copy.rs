@@ -1,11 +1,13 @@
 //! Rows in PostgreSQL's binary `COPY` format, encoded straight into a buffer: a row is its field count, then each
 //! field as its length and its bytes, big-endian. Geometries are TWKB with OSM's 7 decimal digits, which PostGIS reads
-//! with `ST_GeomFromTWKB` exactly as they were, or EWKB with SRID 4326, by the database's [`GeometryFormat`].
+//! with `ST_GeomFromTWKB` exactly as they were, or EWKB with SRID 4326, and a way's node IDs are packed or an
+//! `int8[]`, by the database's [`Storage`].
 
 use osmflow::{Info, Location, Member, MemberType, Timestamp, osc};
 use twkb::{write_scaled_line_string, write_scaled_point};
 
-use crate::GeometryFormat;
+use crate::Storage;
+use crate::varint::pack_ids;
 
 /// The start of a binary `COPY` stream: its signature, no flags, and no header extension.
 pub(crate) const HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0";
@@ -52,20 +54,20 @@ impl From<&osc::Meta> for Meta {
     }
 }
 
-/// Rows of one table, in the binary `COPY` format, without the stream's header and trailer, their geometries in one
-/// format.
+/// Rows of one table, in the binary `COPY` format, without the stream's header and trailer, their geometries and way
+/// node lists in one storage.
 #[derive(Debug, Default)]
 pub(crate) struct Rows {
     pub(crate) buf: Vec<u8>,
     pub(crate) count: u64,
-    geometry: GeometryFormat,
+    storage: Storage,
 }
 
 impl Rows {
-    /// No rows yet, their geometries to be in `geometry`.
-    pub(crate) fn new(geometry: GeometryFormat) -> Self {
+    /// No rows yet, to be stored as `storage`.
+    pub(crate) fn new(storage: Storage) -> Self {
         Self {
-            geometry,
+            storage,
             ..Self::default()
         }
     }
@@ -103,7 +105,7 @@ impl Rows {
             .i32(0)
             .i64(rev)
             .tags(tags)
-            .ids(nodes)
+            .way_nodes(nodes)
             .line(line);
     }
 
@@ -199,6 +201,14 @@ impl Rows {
         })
     }
 
+    /// A way's node IDs: an `int8[]` when plain, packed in a `bytea` otherwise.
+    fn way_nodes(&mut self, nodes: impl ExactSizeIterator<Item = i64>) -> &mut Self {
+        match self.storage {
+            Storage::Plain => self.ids(nodes),
+            Storage::Packed => self.var(|b| pack_ids(b, nodes)),
+        }
+    }
+
     /// A relation's members, as three columns: `"char"[]` types, `int8[]` IDs, `text[]` roles.
     pub(crate) fn members<'a>(
         &mut self,
@@ -231,12 +241,12 @@ impl Rows {
         let Some(loc) = loc else {
             return self.null();
         };
-        let format = self.geometry;
+        let format = self.storage;
         self.var(|b| match format {
-            GeometryFormat::Twkb => {
+            Storage::Packed => {
                 write_scaled_point(b, DIGITS, xy(loc)).expect("7 digits are in range");
             }
-            GeometryFormat::Wkb => {
+            Storage::Plain => {
                 ewkb_header(b, 1);
                 push_location(b, loc);
             }
@@ -248,13 +258,13 @@ impl Rows {
         let Some(locs) = locs.filter(|l| l.len() >= 2) else {
             return self.null();
         };
-        let format = self.geometry;
+        let format = self.storage;
         self.var(|b| match format {
-            GeometryFormat::Twkb => {
+            Storage::Packed => {
                 write_scaled_line_string(b, DIGITS, locs.iter().map(|&l| xy(l)))
                     .expect("7 digits are in range");
             }
-            GeometryFormat::Wkb => {
+            Storage::Plain => {
                 ewkb_header(b, 2);
                 b.extend(len(locs.len()).to_le_bytes());
                 for &loc in locs {
@@ -474,7 +484,7 @@ mod tests {
     fn lines_are_ewkb() {
         // Byte order, line string with an SRID, 4326, 2 points, then each point's x and y
         let locs = [Location::new(10, -20), Location::new(-30, 40)];
-        let mut rows = Rows::new(GeometryFormat::Wkb);
+        let mut rows = Rows::new(Storage::Plain);
         rows.line(Some(&locs));
         let mut ewkb = vec![1, 2, 0, 0, 0x20, 0xe6, 0x10, 0, 0, 2, 0, 0, 0];
         for loc in locs {

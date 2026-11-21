@@ -35,8 +35,8 @@ fn import_and_update() -> Result<(), Box<dyn std::error::Error>> {
 
 | What | Where | Holds |
 |---|---|---|
-| `osm.nodes` | the database | tagged nodes: `id, version, changeset, ts, rev, tags jsonb, geom` (a point); a view over `osm.nodes_twkb` with TWKB |
-| `osm.ways` | the database | every way: the same, with `minor`, `nodes int8[]` and `geom` (a line string with a point per node); a view over `osm.ways_twkb` with TWKB |
+| `osm.nodes` | the database | tagged nodes: `id, version, changeset, ts, rev, tags jsonb, geom` (a point); a view over `osm.nodes_packed` when packed |
+| `osm.ways` | the database | every way: the same, with `minor`, `nodes int8[]` and `geom` (a line string with a point per node); a view over `osm.ways_packed` when packed, whose `nodes` is a `bytea` |
 | `osm.relations` | the database | every relation: the same, with `member_types`, `member_ids` and `member_roles` |
 | `osm.changes` | the database | each row change after the import: `rev, kind, id, action` |
 | `osm.batches`, `osm.state` | the database | each revision's sequences, and where the database is in its stream |
@@ -55,13 +55,19 @@ fn import_and_update() -> Result<(), Box<dyn std::error::Error>> {
 * **`rev`, `minor` and `osm.changes` depend on the batches:** a way whose nodes move in two diffs has `minor` 2 if the
   diffs were applied in two batches, and 1 if in one, and the log lists each object once per batch. Two databases
   kept from one stream have the same rows otherwise.
-* **Geometry is stored as TWKB or WKB,** as [`ImportOpts::geometry`] says, for good: TWKB with OSM's 7 decimal
-  digits in a `bytea` by default, which PostGIS reads back exactly as the locations were and which takes about a
-  quarter of a line's WKB, or PostGIS's `geometry`, which needs no decoding. With TWKB the tables are
-  `osm.nodes_twkb` and `osm.ways_twkb`, and `osm.nodes` and `osm.ways` are views that decode `geom` with
-  `osm.geom(geom)`; with WKB they are the tables. SQL reads `geom` of `osm.nodes` and `osm.ways` as a geometry in both.
-  Postgres inlines the function, so `CREATE INDEX ON osm.ways_twkb USING gist (osm.geom(geom))` serves queries on
-  the view; with WKB the index is `osm.ways USING gist (geom)`.
+* **Rows are stored packed or plain,** as [`ImportOpts::storage`] says, for good. Either way, SQL reads `osm.nodes` and
+  `osm.ways` with `geom` as a PostGIS geometry and `nodes` as an `int8[]`. Packed, the default, makes the tables
+  `osm.nodes_packed` and `osm.ways_packed`, and `osm.nodes` and `osm.ways` are views that decode them with `osm.geom`
+  and `osm.node_ids`. `geom` is TWKB with OSM's 7 decimal digits in a `bytea`, which PostGIS reads back exactly as the
+  locations were; a way's `nodes` is a `bytea` of its IDs, each as the step from the one before, zigzag-encoded and
+  written as an LEB128 varint. In the District of Columbia the geometries take 11.5 MB against 48.3 MB of WKB and the
+  ways' node lists 6.0 MB against 25.9 MB as `int8[]` (New York City: 17.6 MB against 86.7 MB), imported with
+  `osmflow sync import` and summed with `pg_column_size`, on PostgreSQL 18 in Docker on a laptop. `osm.node_ids` decodes
+  about 1.3 µs per node (all ways of New York City: 9.1 s
+  against 0.28 s reading `int8[]`), so bulk readers should read `osm.ways_packed` and decode the bytes themselves.
+  Postgres inlines `osm.geom`, so `CREATE INDEX ON osm.ways_packed USING gist (osm.geom(geom))` serves queries on the
+  view. Plain, `osm.nodes` and `osm.ways` are the tables, with PostGIS's `geometry`, which needs no decoding and an
+  `int8[]`, and the index is `osm.ways USING gist (geom)`.
 * **Geometry** is NULL for a way with fewer than two nodes, or with a node the data does not have, as at the edge of
   an extract.
 * **Untagged nodes** are only in the node file. Their locations are in the ways' geometries.

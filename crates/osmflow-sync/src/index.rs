@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use redb::{Database, Durability, ReadableDatabase as _, ReadableTable as _, TableDefinition};
 
 use crate::SyncError;
+use crate::varint::{read_varint, varint};
 
 const WAYS: TableDefinition<u64, &[u8]> = TableDefinition::new("ways");
 const META: TableDefinition<&str, i64> = TableDefinition::new("meta");
@@ -219,29 +220,6 @@ fn decode(block: u64, mut b: &[u8]) -> Vec<Pair> {
         }
     }
     out
-}
-
-#[expect(clippy::cast_possible_truncation, reason = "the low 7 bits, by design")]
-fn varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-fn read_varint(b: &mut &[u8]) -> u64 {
-    let mut v = 0;
-    let mut shift = 0;
-    while let Some((&byte, rest)) = b.split_first() {
-        *b = rest;
-        v |= u64::from(byte & 0x7f) << shift;
-        if byte < 0x80 {
-            break;
-        }
-        shift += 7;
-    }
-    v
 }
 
 #[cfg(test)]

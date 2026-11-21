@@ -13,8 +13,8 @@ use osmflow::nodes::PagedStore;
 use osmflow::nodes::prelude::*;
 use osmflow::osc::Replication;
 use osmflow_sync::{
-    FileStamp, FollowError, FollowOpts, GeometryFormat, ImportOpts, Mirror, NodeWay, Rebuild, Stop,
-    StopReason, UpdateOpts,
+    FileStamp, FollowError, FollowOpts, ImportOpts, Mirror, NodeWay, Rebuild, Stop, StopReason,
+    Storage, UpdateOpts,
 };
 use postgres::{Client, NoTls};
 
@@ -65,23 +65,23 @@ fn import_update_rebuild() {
         return;
     };
     let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
-    // The same imports, updates and rebuilds with each way of storing geometries: one after the other, in one schema
-    for geometry in [GeometryFormat::Twkb, GeometryFormat::Wkb] {
-        import_update_rebuild_as(&url, geometry);
+    // The same imports, updates and rebuilds with each storage: one after the other, in one schema
+    for storage in [Storage::Packed, Storage::Plain] {
+        import_update_rebuild_as(&url, storage);
     }
 }
 
-fn import_update_rebuild_as(url: &str, geometry: GeometryFormat) {
+fn import_update_rebuild_as(url: &str, storage: Storage) {
     let dir = tempfile::tempdir().unwrap();
     let diffs = dir.path().join("diffs");
     write_state(&diffs, 708, STATE);
     let replication = Replication::local(&diffs);
     let files = dir.path().join("files");
     let mirror = Mirror::new(url, &files);
-    import(&mirror, geometry);
+    import(&mirror, storage);
     let mut db = Client::connect(url, NoTls).unwrap();
-    assert_eq!(mirror.state().unwrap().geometry, geometry);
-    check_geometry(&mut db, geometry);
+    assert_eq!(mirror.state().unwrap().storage, storage);
+    check_geometry(&mut db, storage);
     write_diffs(&diffs, &mut db);
 
     // A stream whose diff 1708 is at another time is not the database's
@@ -138,17 +138,10 @@ fn import_update_rebuild_as(url: &str, geometry: GeometryFormat) {
     );
     check_files(&mirror, 5);
 
-    update_failures(
-        geometry,
-        &mirror,
-        &replication,
-        &mut db,
-        &saved,
-        &one_by_one,
-    );
+    update_failures(storage, &mirror, &replication, &mut db, &saved, &one_by_one);
 
     // The same diffs in one batch: the same rows, each way changed once
-    import(&mirror, geometry);
+    import(&mirror, storage);
     let stats = mirror.update(&replication, &until(1711, 60)).unwrap();
     assert_eq!((stats.batches, stats.diffs), (1, 3));
     assert_eq!(rows(&mut db), one_by_one);
@@ -200,7 +193,7 @@ fn fixture(url: &str) -> Fixture {
     let diffs = dir.path().join("diffs");
     write_state(&diffs, 708, STATE);
     let mirror = Mirror::new(url, dir.path().join("files"));
-    import(&mirror, GeometryFormat::Twkb);
+    import(&mirror, Storage::Packed);
     let mut db = Client::connect(url, NoTls).unwrap();
     write_diffs(&diffs, &mut db);
     // The stream's latest state, which follow reads to know what is new: diff 1712's
@@ -417,31 +410,31 @@ fn rebuild_keeps_repeated_points() {
         return;
     };
     let _db = DB.lock().unwrap_or_else(PoisonError::into_inner);
-    // WKB first, so the TWKB import replaces a WKB schema, where the other test replaces a TWKB one
-    for geometry in [GeometryFormat::Wkb, GeometryFormat::Twkb] {
+    // Plain first, so the packed import replaces a plain schema, where the other test replaces a packed one
+    for storage in [Storage::Plain, Storage::Packed] {
         let dir = tempfile::tempdir().unwrap();
         let diffs = dir.path().join("diffs");
         write_state(&diffs, 708, STATE);
         write_diff(&diffs, 709, DIFF_REPEATED);
         let mirror = Mirror::new(&url, dir.path().join("files"));
-        import(&mirror, geometry);
+        import(&mirror, storage);
         mirror
             .update(&Replication::local(&diffs), &until(1709, 1))
             .unwrap();
         let mut db = Client::connect(&url, NoTls).unwrap();
         let located = db_node_locations(&mirror, &mut db);
         let at = |id| located.iter().find(|(n, _)| *n == id).map(|(_, l)| *l);
-        assert_eq!(at(13_000_000_001), at(13_000_000_002), "{geometry:?}");
+        assert_eq!(at(13_000_000_001), at(13_000_000_002), "{storage:?}");
         fs::remove_file(mirror.index_path()).unwrap();
         mirror.rebuild(&Rebuild::Database).unwrap();
         assert_same_locations(&mirror, &mut db, &located);
         // A way whose geometry has fewer points than it has nodes fails the rebuild
-        let (ways, two) = match geometry {
-            GeometryFormat::Twkb => (
-                "osm.ways_twkb",
+        let (ways, two) = match storage {
+            Storage::Packed => (
+                "osm.ways_packed",
                 "ST_AsTWKB('LINESTRING(0 0,1 1)'::geometry, 7)",
             ),
-            GeometryFormat::Wkb => ("osm.ways", "'SRID=4326;LINESTRING(0 0,1 1)'::geometry"),
+            Storage::Plain => ("osm.ways", "'SRID=4326;LINESTRING(0 0,1 1)'::geometry"),
         };
         db.batch_execute(&format!(
             "UPDATE {ways} SET geom = {two} WHERE id = 2000000001"
@@ -487,7 +480,7 @@ fn db_node_locations(mirror: &Mirror, db: &mut Client) -> Vec<(i64, Option<Locat
 /// files, and a node file of another database (from the files in `saved`). `one_by_one` holds the rows after diffs
 /// 1709 to 1711 applied one per batch.
 fn update_failures(
-    geometry: GeometryFormat,
+    storage: Storage,
     mirror: &Mirror,
     replication: &Replication,
     db: &mut Client,
@@ -496,7 +489,7 @@ fn update_failures(
 ) {
     // The third batch of an update fails after its moved node reached the node file, the first two committed: the
     // retry on the same mirror applies the third, moving the way through the node, and gives the same rows
-    import(mirror, geometry);
+    import(mirror, storage);
     let mut open = mirror.open().unwrap();
     db.batch_execute(
         "CREATE FUNCTION osm.fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE 'injected'; END $$; \
@@ -541,40 +534,59 @@ fn update_failures(
     );
 }
 
-/// The tables and views `geometry` makes of `osm.ways`, and an index serving a bbox query on it.
-fn check_geometry(db: &mut Client, geometry: GeometryFormat) {
-    let info = |db: &mut Client, table: &str| -> Option<(String, String)> {
+/// The tables and views `storage` makes of `osm.ways`, and an index serving a bbox query on it.
+fn check_geometry(db: &mut Client, storage: Storage) {
+    let info = |db: &mut Client, table: &str, column: &str| -> Option<(String, String)> {
         let row = db
             .query_opt(
                 "SELECT c.relkind::text, format_type(a.atttypid, a.atttypmod) FROM pg_class c \
-                 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'geom' WHERE c.oid = to_regclass($1)",
-                &[&table],
+                 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = $2 WHERE c.oid = to_regclass($1)",
+                &[&table, &column],
             )
             .unwrap()?;
         Some((row.get(0), row.get(1)))
     };
-    let index = match geometry {
-        GeometryFormat::Twkb => {
-            // The stored table has the bytes, and the view decodes them
-            assert_eq!(
-                info(db, "osm.ways_twkb"),
-                Some(("r".into(), "bytea".into()))
-            );
-            assert_eq!(
-                info(db, "osm.nodes_twkb"),
-                Some(("r".into(), "bytea".into()))
-            );
-            let view = info(db, "osm.ways").unwrap();
-            assert_eq!((view.0.as_str(), view.1.ends_with("geometry")), ("v", true));
-            "osm.ways_twkb USING gist (osm.geom(geom))"
+    let of = |kind: &str, ty: &str| Some((kind.to_owned(), ty.to_owned()));
+    let index = match storage {
+        Storage::Packed => {
+            // The stored tables have the bytes, and the views decode them
+            for (table, column) in [
+                ("osm.ways_packed", "geom"),
+                ("osm.ways_packed", "nodes"),
+                ("osm.nodes_packed", "geom"),
+            ] {
+                assert_eq!(info(db, table, column), of("r", "bytea"), "{table}");
+            }
+            let geom = info(db, "osm.ways", "geom").unwrap();
+            assert_eq!((geom.0.as_str(), geom.1.ends_with("geometry")), ("v", true));
+            assert_eq!(info(db, "osm.ways", "nodes"), of("v", "bigint[]"));
+            // Steps of 2^62 and more, up and down: 0, then i64::MAX, then 1
+            let ids: Vec<i64> = db
+                .query_one(
+                    "SELECT osm.node_ids('\\x00feffffffffffffffff01fbffffffffffffffff01')",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(ids, [0, i64::MAX, 1]);
+            "osm.ways_packed USING gist (osm.geom(geom))"
         }
-        GeometryFormat::Wkb => {
-            let line = Some(("r".into(), "geometry(LineString,4326)".into()));
-            assert_eq!(info(db, "osm.ways"), line);
-            assert_eq!(info(db, "osm.ways_twkb"), None);
+        Storage::Plain => {
+            assert_eq!(
+                info(db, "osm.ways", "geom"),
+                of("r", "geometry(LineString,4326)")
+            );
+            assert_eq!(info(db, "osm.ways", "nodes"), of("r", "bigint[]"));
+            assert_eq!(info(db, "osm.ways_packed", "geom"), None);
             "osm.ways USING gist (geom)"
         }
     };
+    // Either way, `osm.ways` gives the node list
+    let nodes: Vec<i64> = db
+        .query_one("SELECT nodes FROM osm.ways WHERE id = 210476684", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(nodes, WAY_NODES);
     // `osm.geom` is inlined, so an index on it serves a query through the view, as the database builds it with only
     // pg_catalog in the search path
     db.batch_execute(&format!(
@@ -593,10 +605,53 @@ fn check_geometry(db: &mut Client, geometry: GeometryFormat) {
         .unwrap();
 }
 
-fn import(mirror: &Mirror, geometry: GeometryFormat) {
+/// The nodes of way 210476684, as the PBF file gives them.
+const WAY_NODES: [i64; 39] = [
+    2_205_706_485,
+    2_205_706_484,
+    2_205_706_481,
+    2_712_288_731,
+    2_712_288_732,
+    2_712_288_734,
+    2_712_288_737,
+    2_712_288_739,
+    2_712_288_738,
+    2_712_288_736,
+    2_712_288_735,
+    2_712_288_733,
+    2_712_288_730,
+    2_712_288_729,
+    2_710_937_390,
+    2_205_706_478,
+    2_205_706_475,
+    2_205_706_460,
+    2_205_706_468,
+    2_205_706_472,
+    2_205_706_464,
+    1_886_651_646,
+    2_205_706_444,
+    2_205_706_452,
+    2_710_937_359,
+    2_205_706_456,
+    1_886_651_627,
+    1_886_651_588,
+    1_886_651_677,
+    2_710_937_365,
+    2_710_937_364,
+    2_710_937_367,
+    2_710_937_369,
+    1_724_610_187,
+    2_710_937_373,
+    2_710_937_377,
+    2_710_937_380,
+    2_710_937_391,
+    2_205_706_485,
+];
+
+fn import(mirror: &Mirror, storage: Storage) {
     let opts = ImportOpts {
         replace: true,
-        geometry,
+        storage,
         ..ImportOpts::default()
     };
     let stats = mirror.import(PBF, None, &opts).unwrap();

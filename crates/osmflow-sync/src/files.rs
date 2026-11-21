@@ -11,7 +11,7 @@ use osmflow::nodes::prelude::*;
 use osmflow::osc::{Replication, State};
 use tracing::info;
 
-use crate::db::DbState;
+use crate::db::{DbState, Table};
 use crate::index::Pair;
 use crate::update::Changes;
 use crate::{OpenMirror, SyncError};
@@ -104,13 +104,16 @@ impl OpenMirror {
             return Ok(());
         }
         let rows = self.client.query(
-            "SELECT id, nodes FROM osm.ways WHERE id IN \
-             (SELECT id FROM osm.changes WHERE kind = 'w' AND action = 'u' AND rev > $1)",
+            &format!(
+                "SELECT id, nodes FROM {} WHERE id IN \
+                 (SELECT id FROM osm.changes WHERE kind = 'w' AND action = 'u' AND rev > $1)",
+                Table::Ways.name(state.storage)
+            ),
             &[&rev],
         )?;
         let mut add: Vec<Pair> = Vec::new();
         for row in rows {
-            add.extend(way_pairs(row.get(0), &row.get::<_, Vec<i64>>(1)));
+            add.extend(way_pairs(row.get(0), &state.storage.node_ids(&row, 1)));
         }
         add.sort_unstable();
         add.dedup();

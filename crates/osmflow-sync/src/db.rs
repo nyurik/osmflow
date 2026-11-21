@@ -5,11 +5,12 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use osmflow::Timestamp;
-use postgres::{CopyInWriter, GenericClient};
+use postgres::{CopyInWriter, GenericClient, Row};
 
 use crate::SyncError;
 use crate::copy::{HEADER, Rows, TRAILER};
 pub(crate) use crate::tls::connect;
+use crate::varint::unpack_ids;
 
 /// The format of the `osm` schema this crate reads and writes.
 pub(crate) const SCHEMA_VERSION: i32 = 3;
@@ -28,17 +29,18 @@ pub struct DbState {
     /// The time of that sequence's state.
     pub timestamp: Option<Timestamp>,
     /// How `osm.nodes` and `osm.ways` store their geometries.
-    pub geometry: GeometryFormat,
+    pub storage: Storage,
 }
 
-/// How `osm.nodes` and `osm.ways` store their geometries: chosen by the import, kept by every update.
+/// How `osm.nodes` and `osm.ways` store their rows: chosen by the import, kept by every update.
 ///
-/// SQL reads `geom` of `osm.nodes` and `osm.ways` as a PostGIS geometry in either format. With TWKB the tables are
-/// `osm.nodes_twkb` and `osm.ways_twkb`, and `osm.nodes` and `osm.ways` are views over them that decode `geom` with
-/// `osm.geom(geom)`. That function is inlined, so an index on `osm.ways_twkb (osm.geom(geom))` serves queries on the
-/// view `osm.ways`; with WKB the index is on `osm.ways (geom)`.
+/// SQL reads `osm.nodes` and `osm.ways` with `geom` as a PostGIS geometry and `nodes` as an `int8[]` in either
+/// storage. When packed, the tables are `osm.nodes_packed` and `osm.ways_packed`, and `osm.nodes` and `osm.ways` are
+/// views over them that decode `geom` with `osm.geom(geom)` and `nodes` with `osm.node_ids(nodes)`. `osm.geom` is
+/// inlined, so an index on `osm.ways_packed (osm.geom(geom))` serves queries on the view `osm.ways`; when plain, the
+/// index is on `osm.ways (geom)`.
 ///
-/// It displays and parses as `twkb` or `wkb`, its name in `osm.state`.
+/// It displays and parses as `packed` or `plain`, its name in `osm.state`.
 #[derive(
     Debug,
     Clone,
@@ -53,60 +55,87 @@ pub struct DbState {
     strum::VariantNames,
 )]
 #[strum(serialize_all = "lowercase")]
-pub enum GeometryFormat {
-    /// TWKB with OSM's 7 decimal digits in a `bytea`, which PostGIS reads exactly as the locations were written:
-    /// about a quarter of the size of a line's WKB. Read through the views `osm.nodes` and `osm.ways`.
+pub enum Storage {
+    /// Compact tables, read through the views `osm.nodes` and `osm.ways`. `geom` is TWKB with OSM's 7 decimal digits
+    /// in a `bytea`, which PostGIS reads exactly as the locations were written: 11.5 MB against 48.3 MB of WKB in the
+    /// District of Columbia. A way's `nodes` is a `bytea` of its node IDs, each as the step from the
+    /// one before (the first from 0), zigzag-encoded and written as an LEB128 varint: 6.0 MB against 25.9 MB as an
+    /// `int8[]` in the District of Columbia, 17.6 MB against 86.7 MB in New York City (PostgreSQL 18 in Docker on a
+    /// laptop). `osm.node_ids` decodes about 1.3 µs per node, 9.1 s for all ways of New York City against 0.28 s for
+    /// reading an `int8[]`, so bulk readers should read `osm.ways_packed` and decode the bytes themselves.
     #[default]
-    Twkb,
-    /// PostGIS's `geometry` with SRID 4326, stored as WKB in `osm.nodes` and `osm.ways`: read without decoding.
-    Wkb,
+    Packed,
+    /// PostGIS's `geometry` with SRID 4326, stored as WKB, and `nodes` as an `int8[]`, in the tables `osm.nodes` and
+    /// `osm.ways`: read without decoding.
+    Plain,
 }
 
-/// The SQL of a [`GeometryFormat`], for `schema.sql`.
-pub(crate) struct GeometrySql {
+/// The SQL of a [`Storage`], for `schema.sql`.
+pub(crate) struct StorageSql {
     /// The column type of a point.
     pub(crate) point: &'static str,
     /// The column type of a line string.
     pub(crate) line: &'static str,
-    /// What goes after the tables: `osm.geom` and the views `osm.nodes` and `osm.ways` over the TWKB tables; nothing
-    /// for WKB.
+    /// The column type of a way's node IDs.
+    pub(crate) ids: &'static str,
+    /// What goes after the tables: `osm.geom`, `osm.node_ids` and the views `osm.nodes` and `osm.ways` over the
+    /// packed tables; nothing when plain.
     pub(crate) after: String,
 }
 
-impl GeometryFormat {
-    /// The column types, and the function and views, with PostGIS in schema `postgis`.
+impl Storage {
+    /// The column types, and the functions and views, with PostGIS in schema `postgis`.
     ///
-    /// The function's body names PostGIS's schema: Postgres reads it again where it inlines it, and builds indexes
+    /// The body of `osm.geom` names PostGIS's schema: Postgres reads it again where it inlines it, and builds indexes
     /// with only `pg_catalog` in the search path.
-    pub(crate) fn sql(self, postgis: &str) -> GeometrySql {
+    pub(crate) fn sql(self, postgis: &str) -> StorageSql {
         let s = format!("\"{}\"", postgis.replace('"', "\"\""));
         match self {
-            Self::Twkb => {
-                // `geom` is the last column
+            Self::Packed => {
                 let view = |t: Table| {
-                    let rest = t.columns().strip_suffix("geom").unwrap_or_default();
+                    let columns = t
+                        .columns()
+                        .split(", ")
+                        .map(|c| match (t, c) {
+                            (Table::Ways, "nodes") => "osm.node_ids(nodes) AS nodes",
+                            (_, "geom") => "osm.geom(geom) AS geom",
+                            _ => c,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!(
-                        "CREATE VIEW {} AS SELECT {rest}osm.geom(geom) AS geom FROM {};",
+                        "CREATE VIEW {} AS SELECT {columns} FROM {};",
                         <&str>::from(t),
                         t.name(self)
                     )
                 };
-                GeometrySql {
+                StorageSql {
                     point: "bytea",
                     line: "bytea",
+                    ids: "bytea",
                     after: format!(
                         "CREATE FUNCTION osm.geom(g bytea) RETURNS {s}.geometry LANGUAGE sql IMMUTABLE PARALLEL SAFE \
-                         AS $$ SELECT {s}.ST_SetSRID({s}.ST_GeomFromTWKB(g), 4326) $$;\n{}\n{}",
+                         AS $$ SELECT {s}.ST_SetSRID({s}.ST_GeomFromTWKB(g), 4326) $$;\n{}\n{}\n{}",
+                        include_str!("node_ids.sql"),
                         view(Table::Nodes),
                         view(Table::Ways)
                     ),
                 }
             }
-            Self::Wkb => GeometrySql {
+            Self::Plain => StorageSql {
                 point: "geometry(Point, 4326)",
                 line: "geometry(LineString, 4326)",
+                ids: "int8[]",
                 after: String::new(),
             },
+        }
+    }
+
+    /// The node IDs of a way, from its `nodes` column in the table that stores it.
+    pub(crate) fn node_ids(self, row: &Row, column: usize) -> Vec<i64> {
+        match self {
+            Self::Packed => unpack_ids(row.get(column)),
+            Self::Plain => row.get(column),
         }
     }
 }
@@ -124,7 +153,7 @@ impl DbState {
         }
         let row = client
             .query_opt(
-                "SELECT id, version, rev, url, sequence, (extract(epoch FROM timestamp) * 1000)::int8, geometry \
+                "SELECT id, version, rev, url, sequence, (extract(epoch FROM timestamp) * 1000)::int8, storage \
                  FROM osm.state",
                 &[],
             )?
@@ -142,10 +171,10 @@ impl DbState {
             url: row.get(3),
             sequence: row.get(4),
             timestamp: row.get::<_, Option<i64>>(5).map(Timestamp::from_millis),
-            geometry: {
+            storage: {
                 let name: &str = row.get(6);
                 name.parse().map_err(|_| {
-                    SyncError::state(format!("unknown geometry format {name:?} in osm.state"))
+                    SyncError::state(format!("unknown storage {name:?} in osm.state"))
                 })?
             },
         })
@@ -163,12 +192,12 @@ pub(crate) enum Table {
 }
 
 impl Table {
-    /// The table that stores the rows in `format`: with TWKB, `osm.nodes_twkb` and `osm.ways_twkb`, as `osm.nodes` and
-    /// `osm.ways` are views.
-    pub(crate) fn name(self, format: GeometryFormat) -> &'static str {
+    /// The table that stores the rows in `format`: when packed, `osm.nodes_packed` and `osm.ways_packed`, as
+    /// `osm.nodes` and `osm.ways` are views.
+    pub(crate) fn name(self, format: Storage) -> &'static str {
         match (self, format) {
-            (Self::Nodes, GeometryFormat::Twkb) => "osm.nodes_twkb",
-            (Self::Ways, GeometryFormat::Twkb) => "osm.ways_twkb",
+            (Self::Nodes, Storage::Packed) => "osm.nodes_packed",
+            (Self::Ways, Storage::Packed) => "osm.ways_packed",
             _ => self.into(),
         }
     }
@@ -223,11 +252,7 @@ pub(crate) struct Writers {
 }
 
 impl Writers {
-    pub(crate) fn start(
-        url: &str,
-        connections: usize,
-        format: GeometryFormat,
-    ) -> Result<Self, SyncError> {
+    pub(crate) fn start(url: &str, connections: usize, format: Storage) -> Result<Self, SyncError> {
         let (tx, rx) = bounded(connections * 4);
         let threads = (0..connections.max(1))
             .map(|i| {
@@ -261,11 +286,7 @@ impl Writers {
 }
 
 /// One connection's work: a `COPY` for each run of rows of one table.
-fn write(
-    url: &str,
-    rx: &Receiver<(Table, Vec<u8>)>,
-    format: GeometryFormat,
-) -> Result<(), SyncError> {
+fn write(url: &str, rx: &Receiver<(Table, Vec<u8>)>, format: Storage) -> Result<(), SyncError> {
     let mut client = connect(url)?;
     client.batch_execute("SET synchronous_commit = off; SET default_toast_compression = lz4")?;
     let mut next = rx.recv().ok();
