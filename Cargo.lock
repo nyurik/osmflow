@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "osmflow-cli"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "osmflow-sync"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
