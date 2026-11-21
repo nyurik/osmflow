@@ -561,15 +561,31 @@ fn check_geometry(db: &mut Client, tables: TableLayout) {
             let geom = info(db, "osm.ways", "geom").unwrap();
             assert_eq!((geom.0.as_str(), geom.1.ends_with("geometry")), ("v", true));
             assert_eq!(info(db, "osm.ways", "nodes"), of("v", "bigint[]"));
-            // Steps of 2^62 and more, up and down: 0, then i64::MAX, then 1
-            let ids: Vec<i64> = db
-                .query_one(
-                    "SELECT osm.node_ids('\\x00feffffffffffffffff01fbffffffffffffffff01')",
-                    &[],
-                )
-                .unwrap()
-                .get(0);
-            assert_eq!(ids, [0, i64::MAX, 1]);
+            // Packed node lists decoded by SQL: each ID is a zigzagged varint step from the one before
+            for (hex, expected) in [
+                ("", &[][..]),
+                ("00", &[0]),
+                ("02", &[1]),
+                ("01", &[-1]),
+                // Steps 100, +1, -2, +300, the bytes `varint`'s unit test expects of Rust
+                ("c8010203d804", &[100, 101, 99, 399]),
+                // A 5-byte first ID, then small steps up and down
+                (
+                    "8088e2ed600215",
+                    &[13_000_000_000, 13_000_000_001, 12_999_999_990],
+                ),
+                // Steps of 2^62 and more, up and down
+                (
+                    "00feffffffffffffffff01fbffffffffffffffff01",
+                    &[0, i64::MAX, 1],
+                ),
+            ] {
+                let ids: Vec<i64> = db
+                    .query_one(&format!("SELECT osm.node_ids('\\x{hex}')"), &[])
+                    .unwrap()
+                    .get(0);
+                assert_eq!(ids, expected, "{hex}");
+            }
             "osm.ways_packed USING gist (osm.geom(geom))"
         }
         TableLayout::Plain => {
