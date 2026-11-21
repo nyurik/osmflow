@@ -27,7 +27,9 @@ pub struct Args {
 /// Where the data is: the database and the directory of its files.
 #[derive(Debug, clap::Args)]
 struct Place {
-    /// The database: `postgresql://user@host/db`, or `host=… user=… dbname=…`. Connections are not encrypted.
+    /// The database: `postgresql://user@host/db`, or `host=… user=… dbname=…`. TLS is as its `sslmode` asks, as with
+    /// libpq: `prefer` by default, `disable`, `require`, `verify-ca` or `verify-full`, the last two checking the server's
+    /// certificate against the authorities in the PEM file `sslrootcert`.
     #[arg(long, env = "DATABASE_URL", value_name = "URL")]
     db: String,
     /// The directory of the node file and the reverse index, beside the database.

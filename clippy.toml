@@ -15,5 +15,6 @@ doc-valid-idents = ["NVMe", "GeoJSON", "FeatureCollection", "PostGIS", ".."]
 
 # Two versions each: base64, getrandom and wasi through `postgres` and through `ureq`, which neither crate lets us
 # unify; syn 2 through strum's derives, and syn 3 through thiserror's and clap's; thiserror 1 and hashbrown 0.17
-# through `wkb` and its num_enum derive
-allowed-duplicate-crates = ["base64", "getrandom", "hashbrown", "syn", "thiserror", "thiserror-impl", "wasi"]
+# through `wkb` and its num_enum derive; const-oid 0.9 through tokio-postgres-rustls's x509-cert, and 0.10 through
+# postgres's hmac
+allowed-duplicate-crates = ["base64", "const-oid", "getrandom", "hashbrown", "syn", "thiserror", "thiserror-impl", "wasi"]

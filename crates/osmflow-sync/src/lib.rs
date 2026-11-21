@@ -10,6 +10,8 @@ mod index;
 mod rebuild;
 mod sort;
 mod stop;
+#[cfg(feature = "tls")]
+mod tls;
 mod update;
 
 use std::path::{Path, PathBuf};
@@ -28,6 +30,8 @@ pub use crate::rebuild::{Rebuild, RebuildStats};
 #[cfg(feature = "signals")]
 pub use crate::stop::{Signal, SignalError, SignalGuard};
 pub use crate::stop::{Stop, StopReason};
+#[cfg(feature = "tls")]
+pub use crate::tls::TlsError;
 pub use crate::update::{UpdateOpts, UpdateStats};
 
 /// A database kept current from replication, and the directory of its node file and reverse index.
@@ -69,7 +73,8 @@ pub struct Status {
 
 impl Mirror {
     /// A mirror in the database at `url` (`postgresql://user@host/db`, or `host=… user=…`), with its files in `dir`.
-    /// Connections are not encrypted.
+    /// With the `tls` feature, connections use TLS as its `sslmode` and `sslrootcert` ask, as the
+    /// [connections](crate#connections) section says; without it, they are not encrypted.
     pub fn new(url: impl Into<String>, dir: impl Into<PathBuf>) -> Self {
         Self {
             url: url.into(),
