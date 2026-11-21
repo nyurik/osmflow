@@ -83,7 +83,7 @@ impl SslMode {
 /// Connects as `url` asks, `sslmode` and `sslrootcert` included.
 pub(crate) fn connect(url: &str) -> Result<Client, SyncError> {
     let (config, mode, root_cert) = parse(url)?;
-    // With `disable`, `postgres` does not use it
+    // With `disable`, it reads no file, and `postgres` does not use it
     let tls = MakeRustlsConnect::new(client_config(mode, root_cert.as_deref())?);
     Ok(config.connect(tls)?)
 }
@@ -495,6 +495,7 @@ mod tests {
         assert!(err.to_string().contains("no PEM certificate"), "{err}");
 
         // Not read when not needed, as libpq
+        client_config(SslMode::Disable, Some(&missing)).unwrap();
         client_config(SslMode::Prefer, Some(&missing)).unwrap();
         client_config(SslMode::Require, None).unwrap();
     }
