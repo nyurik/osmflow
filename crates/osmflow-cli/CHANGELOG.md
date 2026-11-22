@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1](https://github.com/nyurik/osmflow/compare/osmflow-cli-v0.16.0...osmflow-cli-v0.16.1) - 2026-11-21
+
+### Added
+
+- *(sync)* `NodeIds` reads a way's node list in either layout ([#72](https://github.com/nyurik/osmflow/pull/72))
+
 ## [0.16.0](https://github.com/nyurik/osmflow/compare/osmflow-cli-v0.15.0...osmflow-cli-v0.16.0) - 2026-11-21
 
 ### Added
